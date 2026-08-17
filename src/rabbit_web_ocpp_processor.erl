@@ -9,7 +9,7 @@
 -feature(maybe_expr, enable).
 
 -export([info/2,
-         init/7,
+         init/8,
          process_incoming/2,
          terminate/3,
          handle_info/2,
@@ -89,20 +89,21 @@
            RawSocket :: rabbit_net:socket(),
            ConnectionName :: binary(),
            User :: #user{},
+           AuthzCtx :: #{binary() := binary()},
            SendFun :: send_fun()) ->
     {ok, state()} | {error, term()}.
-init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun) ->
+init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun) ->
     %% Check whether peer closed the connection.
     %% For example, this can happen when connection was blocked because of resource
     %% alarm and client therefore disconnected.
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
-            process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, SocketEnds);
+            process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun, SocketEnds);
         {error, Reason} ->
             {error, {socket_ends, Reason}}
     end.
 
-process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
+process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
     case rabbit_net:socket_ends(Socket, inbound) of
         {ok, SocketEnds} ->
             {PeerIp, PeerPort, Ip, Port} = SocketEnds;
@@ -113,8 +114,6 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, SendFun, {Pe
     %% 2. Authentication & Authorization
     Result =
         maybe
-            % Authz context might include ClientId specific info if needed by backends
-            AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
             ok = register_client_id(Vhost, ClientId),
             rabbit_core_metrics:auth_attempt_succeeded(PeerIp, ClientId, ocpp),
 

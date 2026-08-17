@@ -46,6 +46,7 @@
           vhost :: rabbit_types:vhost(),
           client_id :: client_id(),
           user :: #user{},
+          authz_ctx = #{} :: #{binary() => binary()},
           ssl_login_name = none :: none | binary(),
           auth_mechanism = <<"UNKNOWN">> :: binary(),
           conn_name :: option(binary()),
@@ -93,22 +94,27 @@ init(Req, Opts) ->
         _ ->
             {Username0, Password0} = basic_auth_creds(Req),
             SslLoginName = ssl_login_name_from_req(Req),
+            %% We don't use rabbit_net:maybe_get_proxy_socket(Sock) on purpose,
+            %% because we don't trust the PROXY protocol, maybe @TODO.
+            IsSsl = cowboy_req:scheme(Req) =:= <<"https">>,
             Result = maybe
                 ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
                 ok ?= check_vhost_alive(Vhost),
                 {ok, ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
                 {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
-                {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp),
+                {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp, IsSsl),
                 ok ?= check_user_loopback(User0, PeerIp),
-                AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>},
+                ok ?= check_tls_only(User0, IsSsl, PeerIp),
+                AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>,
+                             <<"ssl">> => rabbit_data_coercion:to_binary(IsSsl)},
                 ok ?= check_vhost_access(Vhost, User0, ClientId, PeerIp, AuthzCtx),
-                {ok, Req1, Vhost, ClientId, User0, ProtoVer}
+                {ok, Req1, Vhost, ClientId, User0, ProtoVer, AuthzCtx}
             end,
             %% Keep identifying info in the state so terminate/3 can log
             %% meaningfully when the connection is rejected below.
             RejState = #state{vhost = Vhost, client_id = ClientId, conn_name = PeerAddr},
             case Result of
-                {ok, Req2, V2, CId, User, ProtocolVer} ->
+                {ok, Req2, V2, CId, User, ProtocolVer, AuthzCtx1} ->
                     ProxyInfo   = maps:get(proxy_header, Req2, undefined),
                     WsOpts0     = proplists:get_value(ws_opts, Opts, #{}),
                     IdleMs      = maps:get(idle_timeout, WsOpts0, ?DEFAULT_IDLE_TIMEOUT_MS),
@@ -125,7 +131,8 @@ init(Req, Opts) ->
                                   end,
                     IdleSec     = case IdleMs of infinity -> 0; Ms -> Ms div 1000 end,
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
-                                   user = User, client_id = CId, idle_timeout = IdleSec,
+                                   user = User, authz_ctx = AuthzCtx1,
+                                   client_id = CId, idle_timeout = IdleSec,
                                    ssl_login_name = SslLoginName,
                                    auth_mechanism = auth_mechanism(Username0, SslLoginName)},
                     {?MODULE, Req2, State, WsOpts};
@@ -159,7 +166,8 @@ info(Pid, Items) ->
 -spec websocket_init(state()) ->
     {cowboy_websocket:commands(), state()} |
     {cowboy_websocket:commands(), state, hibernate}.
-websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = ClientId, user = User, proto_ver = ProtoVer}) ->
+websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = ClientId,
+                               user = User, authz_ctx = AuthzCtx, proto_ver = ProtoVer}) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [web_ocpp]}),
     %% The socket (incl. proxy protocol info) is only available from
     %% takeover/7 onwards, so the proper connection name can only be
@@ -172,7 +180,7 @@ websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = Clien
             % Inside `init` of the processor "connection_created" is called for management UI to show the connection
             case rabbit_web_ocpp_processor:init(Vhost, ClientId, ProtoVer,
                                                 rabbit_net:unwrap_socket(Socket),
-                                                ConnName, User, fun send_reply/1) of
+                                                ConnName, User, AuthzCtx, fun send_reply/1) of
                 {ok, ProcState} ->
                     ?LOG_INFO("Accepted Web OCPP connection ~ts for client ID ~ts",
                                 [ConnName, ClientId]),
@@ -532,8 +540,11 @@ check_vhost_access(Vhost, User, _ClientId, PeerIp, AuthzCtx) ->
         {error, access_refused}
     end.
 
-check_user_login(Vhost, Username, Password, ClientId, PeerIp) ->
-    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, Password}],
+check_user_login(Vhost, Username, Password, ClientId, PeerIp, IsSsl) ->
+    %% rabbitmq_auth_backend_http forwards every non-internal auth property to
+    %% the HTTP service, so 'ssl' reaches it as a request parameter.
+    AuthProps = [{vhost, Vhost}, {client_id, ClientId}, {password, Password},
+                 {ssl, IsSsl}],
     % For cases when authenticating using an x.509 certificate, Password equals atom "none"
     case rabbit_access_control:check_user_login(Username, AuthProps) of
         {ok, User = #user{username = RabbitUser}} ->
@@ -556,6 +567,23 @@ check_user_loopback(#user{username = Username}, PeerIp) ->
             ok;
         not_allowed ->
             ?LOG_ERROR("OCPP login failed: user '~s' can only connect via localhost", [Username]),
+            auth_attempt_failed(PeerIp, Username),
+            {error, access_refused}
+    end.
+
+%% Reject users tagged 'tlsonly' on the plain listener. The tag is read off the
+%% authenticated user, so any authentication backend can set it. Rejections look
+%% like any other refusal to the client, so the plain listener cannot be used to
+%% tell valid credentials apart from invalid ones.
+check_tls_only(_User, _IsSsl = true, _PeerIp) ->
+    ok;
+check_tls_only(#user{username = Username, tags = Tags}, false, PeerIp) ->
+    case lists:member(tlsonly, Tags) of
+        false ->
+            ok;
+        true ->
+            ?LOG_ERROR("OCPP login failed: user '~s' is tagged 'tlsonly' and can "
+                       "only connect over TLS", [Username]),
             auth_attempt_failed(PeerIp, Username),
             {error, access_refused}
     end.
