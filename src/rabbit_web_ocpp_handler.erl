@@ -221,7 +221,7 @@ websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = 
                                [ClientId, ConnName, Reason]),
                     % Use access_refused specific code if possible, otherwise protocol error
                     CloseCode = case Reason of
-                                    {error, access_refused} -> ?CLOSE_POLICY_VIOLATION;
+                                    access_refused -> ?CLOSE_POLICY_VIOLATION;
                                     _ -> ?CLOSE_PROTOCOL_ERROR
                                 end,
                     stop(State, CloseCode, Reason)
@@ -610,6 +610,7 @@ stop(State) ->
     stop(State, ?CLOSE_NORMAL, "OCPP died").
 
 stop(State, CloseCode, Error0) ->
+    %% Every caller passes a binary, an atom or a string: rabbit_data_coercion has no tuple clause.
     Error = rabbit_data_coercion:to_binary(Error0),
     {[{close, CloseCode, Error}], State}.
 

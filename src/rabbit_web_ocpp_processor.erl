@@ -211,15 +211,15 @@ process_incoming(McOcpp = #ocpp_msg{},
                         {error, Reason} ->
                             ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
                                         [rabbit_misc:rs(ExchangeName), Reason]),
-                            {error, {publish_failed, Reason}, State}
+                            {error, publish_failed, State}
                     end;
                 {error, not_found} ->
                     ?LOG_ERROR("Exchange ~ts does not exist for ClientId ~ts", [rabbit_misc:rs(ExchangeName), ClientId]),
-                    {error, {exchange_not_found, ExchangeName}, State}
+                    {error, exchange_not_found, State}
             end;
-        {error, access_refused} = Error ->
+        {error, access_refused} ->
             ?LOG_WARNING("OCPP publish refused for ClientId ~ts to exchange ~ts", [ClientId, rabbit_misc:rs(ExchangeName)]),
-            {error, Error, State}
+            {error, access_refused, State}
     end.
 
 deliver_to_queues(Message,
@@ -546,27 +546,12 @@ ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
                          check_resource_access(User, XName, write, AuthzCtx)
                  end of
                 ok -> % DLX check passed or not needed
-                    %% 2. Declare the queue
-                    QType = rabbit_amqqueue:get_queue_type(QArgs), % Define QType
-                    Owner = none,
-                    Durable = true,
-                    AutoDelete = false,
-                    Q0 = amqqueue:new(QName, none, Durable, AutoDelete, Owner, QArgs, Vhost, % Use QArgs
-                                      #{user => Username}, QType), % Use QType
-
-                    case rabbit_queue_type:declare(Q0, node()) of
-                        {new, _Queue} -> % Successfully declared
-                            rabbit_core_metrics:queue_created(QName),
+                    %% 2. Declare the queue, unless it is already there
+                    case ensure_queue(QName, QArgs, Vhost, Username) of
+                        ok ->
                             bind_queue(State); % Proceed to binding
-                        {existing, _ExistingQ} -> % Queue already exists
-                            ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.", [rabbit_misc:rs(QName)]),
-                            bind_queue(State); % Proceed to binding
-                        {error, queue_limit_exceeded, Reason, ReasonArgs} ->
-                            ?LOG_ERROR(Reason, ReasonArgs),
-                            {error, {queue_declare_failed, queue_limit_exceeded}};
-                        Other ->
-                            ?LOG_ERROR("Failed to declare OCPP queue ~s: ~p", [rabbit_misc:rs(QName), Other]),
-                            {error, {queue_declare_failed, queue_declare_error}}
+                        {error, _} = Error ->
+                            Error
                     end;
                 {error, access_refused} -> % DLX permission failed
                     ?LOG_WARNING("OCPP DLX permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
@@ -575,6 +560,51 @@ ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
         {error, access_refused} ->
             ?LOG_WARNING("OCPP configure permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
             {error, {queue_declare_failed, access_refused}}
+    end.
+
+%% Declaring a classic queue always starts a queue process, which then writes
+%% to the metadata store even when the queue turns out to already exist. Under
+%% a connection storm that write is what times out, so look the queue up first
+%% and only declare when it is missing, the way rabbit_mqtt_processor does.
+-spec ensure_queue(rabbit_amqqueue:name(), rabbit_framing:amqp_table(),
+                   rabbit_types:vhost(), rabbit_types:username()) ->
+    ok | {error, term()}.
+ensure_queue(QName, QArgs, Vhost, Username) ->
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, _Q} ->
+            ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.",
+                       [rabbit_misc:rs(QName)]),
+            ok;
+        {error, not_found} ->
+            declare_queue(QName, QArgs, Vhost, Username)
+    end.
+
+-spec declare_queue(rabbit_amqqueue:name(), rabbit_framing:amqp_table(),
+                    rabbit_types:vhost(), rabbit_types:username()) ->
+    ok | {error, term()}.
+declare_queue(QName, QArgs, Vhost, Username) ->
+    QType = rabbit_amqqueue:get_queue_type(QArgs),
+    Owner = none,
+    Durable = true,
+    AutoDelete = false,
+    Q0 = amqqueue:new(QName, none, Durable, AutoDelete, Owner, QArgs, Vhost,
+                      #{user => Username}, QType),
+    case rabbit_queue_type:declare(Q0, node()) of
+        {new, _Queue} ->
+            rabbit_core_metrics:queue_created(QName),
+            ok;
+        {existing, _ExistingQ} ->
+            %% Another connection won the race between the lookup and here.
+            ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.",
+                       [rabbit_misc:rs(QName)]),
+            ok;
+        {error, queue_limit_exceeded, Reason, ReasonArgs} ->
+            ?LOG_ERROR(Reason, ReasonArgs),
+            {error, {queue_declare_failed, queue_limit_exceeded}};
+        Other ->
+            ?LOG_ERROR("Failed to declare OCPP queue ~s: ~p",
+                       [rabbit_misc:rs(QName), Other]),
+            {error, {queue_declare_failed, queue_declare_error}}
     end.
 
 %% Helper function for binding logic
@@ -812,9 +842,21 @@ handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId}}) ->
             {error, <<"Invalid JSON">>}
     end.
 
-%% Seamlessly update both ETS tables without causing 404 errors
+%% Seamlessly update both ETS tables without causing 404 errors.
+%% connection_created_stats is owned by rabbit_mgmt_storage, which the
+%% management agent does not start when management_agent.disable_metrics_collector
+%% is set, so there is nothing to refresh in that case.
 -spec force_stats_refresh(state()) -> ok.
-force_stats_refresh(State = #state{cfg = #cfg{client_id = ClientId}}) ->
+force_stats_refresh(State) ->
+    case ets:whereis(connection_created_stats) of
+        undefined ->
+            ok;
+        Tid ->
+            force_stats_refresh(Tid, State)
+    end.
+
+-spec force_stats_refresh(ets:tid(), state()) -> ok.
+force_stats_refresh(Tid, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     try
         Pid = self(),
         %% Get fresh client properties from our state
@@ -834,13 +876,13 @@ force_stats_refresh(State = #state{cfg = #cfg{client_id = ClientId}}) ->
         % end,
         
         %% 2. Update connection_created_stats table (formatted version) in-place
-        case ets:lookup(connection_created_stats, Pid) of
+        case ets:lookup(Tid, Pid) of
             [{Pid, ConnName, OldStatsInfos}] ->
                 %% Convert proplist to map format using the same function as management plugin
                 FormattedClientProps = rabbit_misc:amqp_table(FreshClientProps),
                 UpdatedStatsInfos = lists:keystore(client_properties, 1, OldStatsInfos,
                                                  {client_properties, FormattedClientProps}),
-                ets:insert(connection_created_stats, {Pid, ConnName, UpdatedStatsInfos}),
+                ets:insert(Tid, {Pid, ConnName, UpdatedStatsInfos}),
                 ?LOG_DEBUG("OCPP updated connection_created_stats table for ~ts", [ClientId]);
             [] ->
                 %% Stats entry doesn't exist yet - that's fine, it will be created on next collection
