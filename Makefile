@@ -26,7 +26,7 @@ endef
 
 LOCAL_DEPS = ssl
 DEPS = rabbit cowboy
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client amqp10_client
 
 PLT_APPS += rabbitmqctl elixir cowlib
 

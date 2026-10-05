@@ -19,6 +19,10 @@
          unset_env/2,
          restart_plugin/2,
          port/2,
+         tls_port/2,
+         ensure_user/3,
+         amqp10_get/2,
+         amqp10_publish_to_cp/3,
          await_session/3,
          exchange/1,
          ensure_user/2,
@@ -98,6 +102,54 @@ restart_plugin(Config, Node) ->
 port(Config, Node) ->
     rabbit_ct_broker_helpers:get_node_config(Config, Node, tcp_port_web_mqtt).
 
+tls_port(Config, Node) ->
+    rabbit_ct_broker_helpers:get_node_config(Config, Node, tcp_port_web_mqtt_tls).
+
+%% -------------------------------------------------------------------
+%% CSMS worker side, AMQP 1.0
+%% -------------------------------------------------------------------
+
+amqp10_session(Config) ->
+    {ok, _} = application:ensure_all_started(amqp10_client),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    OpnConf = #{address => "localhost",
+                port => Port,
+                container_id => <<"ocpp-test">>,
+                sasl => {plain, <<"guest">>, <<"guest">>}},
+    {ok, Conn} = amqp10_client:open_connection(OpnConf),
+    receive {amqp10_event, {connection, Conn, opened}} -> ok
+    after 5000 -> ct:fail(amqp10_connection_not_opened)
+    end,
+    {ok, Session} = amqp10_client:begin_session_sync(Conn),
+    {Conn, Session}.
+
+%% Returns the next message of the queue.
+amqp10_get(Config, QName) ->
+    {Conn, Session} = amqp10_session(Config),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"test-receiver">>, <<"/queues/", QName/binary>>, settled),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail(amqp10_receiver_not_attached)
+    end,
+    Result = amqp10_client:get_msg(Receiver, 5000),
+    ok = amqp10_client:close_connection(Conn),
+    Result.
+
+%% Publishes to the exchange of the plugin, with the client ID as routing key.
+amqp10_publish_to_cp(Config, ClientId, Frame) ->
+    {Conn, Session} = amqp10_session(Config),
+    Address = <<"/exchanges/", (exchange(Config))/binary, "/", ClientId/binary>>,
+    {ok, Sender} = amqp10_client:attach_sender_link_sync(Session, <<"test-sender">>, Address),
+    receive {amqp10_event, {link, Sender, credited}} -> ok
+    after 5000 -> ct:fail(amqp10_sender_not_credited)
+    end,
+    Msg = amqp10_msg:new(<<"tag">>, iolist_to_binary(json:encode(Frame)), false),
+    ok = amqp10_client:send_msg(Sender, Msg),
+    receive {amqp10_disposition, {Outcome, <<"tag">>}} -> ok = amqp10_client:close_connection(Conn),
+                                                          Outcome
+    after 5000 -> ct:fail(amqp10_no_disposition)
+    end.
+
 %% The exchange the plugin publishes to and binds charge point queues to.
 exchange(Config) ->
     X = rabbit_ct_broker_helpers:rpc(Config, 0, application, get_env,
@@ -107,8 +159,13 @@ exchange(Config) ->
 %% OCPP security profiles 1 and 2 use the charge point ID as Basic auth
 %% username, so every test charge point gets a user named after it.
 ensure_user(Config, Username) ->
+    ensure_user(Config, Username, <<"/">>).
+
+ensure_user(_Config, none, _Vhost) ->
+    ok;
+ensure_user(Config, Username, Vhost) ->
     _ = rabbit_ct_broker_helpers:add_user(Config, 0, Username, ?PASSWORD),
-    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, Username, <<"/">>).
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, Username, Vhost).
 
 %% -------------------------------------------------------------------
 %% Charge point side
@@ -117,7 +174,9 @@ ensure_user(Config, Username) ->
 connect(Config, ClientId) ->
     connect(Config, ClientId, #{}).
 
-%% Opts: node, proto ("ocpp1.6" | ...), user, password.
+%% Opts: node, protos, user, password, create_user, vhost, tcp_preface (e.g.
+%% a PROXY protocol header), tls (TLS client options: connects to the TLS
+%% listener).
 connect(Config, ClientId, Opts) ->
     {WS, Status} = try_connect(Config, ClientId, Opts),
     case Status of
@@ -166,18 +225,25 @@ try_connect(Config, ClientId, Opts) ->
     Node = maps:get(node, Opts, 0),
     User = maps:get(user, Opts, ClientId),
     Password = maps:get(password, Opts, ?PASSWORD),
+    Vhost = maps:get(vhost, Opts, <<"/">>),
     case maps:get(create_user, Opts, true) of
-        true -> ensure_user(Config, User);
+        true -> ensure_user(Config, User, Vhost);
         false -> ok
     end,
     Protos = maps:get(protos, Opts, ["ocpp1.6"]),
-    Url = "ws://127.0.0.1:" ++ integer_to_list(port(Config, Node)) ++ "/ocpp/%2F/"
+    {Scheme, Port} = case Opts of
+                         #{tls := _} -> {"wss", tls_port(Config, Node)};
+                         _ -> {"ws", port(Config, Node)}
+                     end,
+    Url = Scheme ++ "://127.0.0.1:" ++ integer_to_list(Port) ++ "/ocpp/"
+          ++ uri_string:quote(binary_to_list(Vhost)) ++ "/"
           ++ uri_string:quote(binary_to_list(ClientId)),
     Auth = case User of
                none -> undefined;
                _ -> [{login, binary_to_list(User)}, {passcode, binary_to_list(Password)}]
            end,
-    WS = rfc6455_client:new(Url, self(), Auth, Protos),
+    WS = rfc6455_client:new(Url, self(), Auth, Protos, maps:get(tcp_preface, Opts, <<>>),
+                            maps:get(tls, Opts, [])),
     case rfc6455_client:open(WS) of
         {ok, [{http_response, Resp}]} -> {WS, http_status(Resp)};
         {close, _} -> {WS, closed}

@@ -26,6 +26,8 @@
 
 all() ->
     [{group, tests},
+     {group, foreseen},
+     {group, tls},
      %% Restarts the node, so it runs last.
      {group, node_restart}].
 
@@ -85,6 +87,34 @@ groups() ->
        %% The plugin did not stop its listener
        listener_stops_with_plugin
       ]},
+     %% Issues found after the review, while fixing the above.
+     {foreseen, [],
+      [%% Workers using AMQP 1.0, RabbitMQ's main protocol since 4.0
+       amqp10_worker_receives_cp_messages,
+       amqp10_worker_can_send_commands,
+       stream_queue_receives_cp_messages,
+       %% Connection limits
+       vhost_connection_limit_is_enforced,
+       user_connection_limit_is_enforced,
+       %% PROXY protocol
+       proxy_protocol_loopback_check_uses_client_address,
+       proxy_protocol_peer_address_is_reported,
+       %% Listing connections
+       http_clients_are_not_listed_as_connections,
+       %% Exchange in vhosts created after the plugin started
+       exchange_is_declared_in_new_vhosts,
+       %% Metrics
+       global_counters_track_ocpp_traffic,
+       %% Back pressure from slow queues
+       slow_queue_throttles_charge_point
+      ]},
+     %% Coverage of the TLS listener: OCPP security profiles 2 and 3.
+     {tls, [],
+      [tls_basic_auth,
+       tls_client_certificate,
+       tls_client_certificate_must_match_client_id,
+       tls_only_user_is_rejected_on_plain_listener
+      ]},
      {node_restart, [],
       [f15_offline_status_survives_node_restart]}
     ].
@@ -110,9 +140,32 @@ end_per_suite(Config) ->
       rabbit_ct_client_helpers:teardown_steps() ++
       rabbit_ct_broker_helpers:teardown_steps()).
 
+init_per_group(tls, Config) ->
+    CertsDir = ?config(rmq_certsdir, Config),
+    TlsConfig = [{port, rabbit_web_ocpp_test_util:tls_port(Config, 0)},
+                 {cacertfile, filename:join([CertsDir, "testca", "cacert.pem"])},
+                 {certfile, filename:join([CertsDir, "server", "cert.pem"])},
+                 {keyfile, filename:join([CertsDir, "server", "key.pem"])},
+                 {verify, verify_peer},
+                 {fail_if_no_peer_cert, false}],
+    set_env(Config, ssl_config, TlsConfig),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                      [rabbit, ssl_cert_login_from, common_name]),
+    ok = rabbit_web_ocpp_test_util:restart_plugin(Config, 0),
+    Env = rabbit_ct_broker_helpers:rpc(Config, 0, application, get_all_env,
+                                       [rabbitmq_web_ocpp]),
+    rabbit_ct_helpers:set_config(Config, [{initial_env, Env},
+                                          {initial_env_before_tls, ?config(initial_env, Config)}]);
 init_per_group(_, Config) ->
     Config.
 
+end_per_group(tls, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
+                                      [rabbitmq_web_ocpp, ssl_config]),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
+                                      [rabbit, ssl_cert_login_from]),
+    ok = rabbit_web_ocpp_test_util:restart_plugin(Config, 0),
+    rabbit_ct_helpers:set_config(Config, {initial_env, ?config(initial_env_before_tls, Config)});
 end_per_group(_, Config) ->
     Config.
 
@@ -578,6 +631,207 @@ f17_allowed_versions_are_configurable(Config) ->
     WS = connect(Config, cid(Config), #{protos => ["ocpp1.6", "ocpp2.0.1"]}),
     ?assert(rabbit_web_ocpp_test_util:is_open(WS)).
 
+%% -------------------------------------------------------------------
+%% Issues found after the review
+%% -------------------------------------------------------------------
+
+%% mc_ocpp converted to AMQP 1.0 with untagged property values.
+amqp10_worker_receives_cp_messages(Config) ->
+    Cid = cid(Config),
+    declare_worker_queue(Config, <<"workers">>, <<"ocpp16.Heartbeat.req">>),
+    WS = connect(Config, Cid),
+    MsgId = call(WS, <<"Heartbeat">>, #{}),
+    ok = await_count(Config, <<"workers">>, 1),
+    {ok, Msg} = rabbit_web_ocpp_test_util:amqp10_get(Config, <<"workers">>),
+    ?assertMatch([2, MsgId, <<"Heartbeat">>, _], json:decode(amqp10_msg:body_bin(Msg))),
+    Props = amqp10_msg:properties(Msg),
+    ?assertEqual(MsgId, maps:get(correlation_id, Props)),
+    ?assertEqual(Cid, maps:get(reply_to, Props)),
+    ?assertEqual(<<"Heartbeat">>, maps:get(subject, Props)).
+
+%% mc_ocpp expected a list of AMQP 1.0 sections, but gets mc_amqp's state.
+amqp10_worker_can_send_commands(Config) ->
+    Cid = cid(Config),
+    WS = connect(Config, Cid),
+    ?assertEqual(accepted,
+                 rabbit_web_ocpp_test_util:amqp10_publish_to_cp(
+                   Config, Cid, [2, <<"csms-1">>, <<"Reset">>, #{<<"type">> => <<"Soft">>}])),
+    ?assertMatch([2, <<"csms-1">>, <<"Reset">>, _], recv(WS)).
+
+%% Streams store messages in AMQP 1.0 format, e.g. for auditing.
+stream_queue_receives_cp_messages(Config) ->
+    declare_worker_queue(Config, <<"audit">>, <<"ocpp16.#">>,
+                         [{<<"x-queue-type">>, longstr, <<"stream">>}]),
+    WS = connect(Config, cid(Config)),
+    MsgIds = [call(WS, <<"Heartbeat">>, #{}) || _ <- [1, 2]],
+    Frames = consume_stream(Config, <<"audit">>, 2),
+    ?assertEqual(MsgIds, [MsgId || [2, MsgId, _, _] <- Frames]),
+    assert_no_frame(WS, 100).
+
+%% Connection limits of vhosts and users (e.g. set by rabbitmqctl
+%% set_vhost_limits) did not apply to OCPP connections.
+vhost_connection_limit_is_enforced(Config) ->
+    Vhost = <<"limited">>,
+    ok = rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    try
+        ok = rabbit_ct_broker_helpers:set_vhost_limit(Config, 0, Vhost, max_connections, 1),
+        _WS = connect(Config, <<"limited-cp1">>, #{vhost => Vhost}),
+        {_, Status} = try_connect(Config, <<"limited-cp2">>, #{vhost => Vhost}),
+        ?assertEqual(429, Status)
+    after
+        close_all_connections(Config),
+        rabbit_ct_broker_helpers:delete_vhost(Config, Vhost)
+    end.
+
+user_connection_limit_is_enforced(Config) ->
+    Cid = cid(Config),
+    rabbit_web_ocpp_test_util:ensure_user(Config, Cid),
+    ok = rabbit_ct_broker_helpers:set_user_limits(Config, Cid, #{max_connections => 0}),
+    {_, Status} = try_connect(Config, Cid, #{create_user => false}),
+    ?assertEqual(429, Status).
+
+%% Behind a load balancer using the PROXY protocol, every client appeared to
+%% connect from the load balancer's address, e.g. from localhost.
+proxy_protocol_loopback_check_uses_client_address(Config) ->
+    set_env(Config, proxy_protocol, true),
+    ok = rabbit_web_ocpp_test_util:restart_plugin(Config, 0),
+    {ok, LoopbackUsers} = rabbit_ct_broker_helpers:rpc(Config, 0, application, get_env,
+                                                       [rabbit, loopback_users]),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                      [rabbit, loopback_users, [<<"guest">>]]),
+    try
+        {_, Status} = try_connect(Config, <<"guest">>,
+                                  #{password => <<"guest">>, create_user => false,
+                                    tcp_preface => proxy_header(Config)}),
+        ?assertEqual(401, Status)
+    after
+        ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env,
+                                          [rabbit, loopback_users, LoopbackUsers])
+    end.
+
+proxy_protocol_peer_address_is_reported(Config) ->
+    set_env(Config, proxy_protocol, true),
+    ok = rabbit_web_ocpp_test_util:restart_plugin(Config, 0),
+    _WS = connect(Config, cid(Config), #{tcp_preface => proxy_header(Config)}),
+    [Pid] = connection_pids(Config),
+    ?assertEqual([{peer_host, {192, 168, 1, 5}}, {peer_port, 40000}],
+                 rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_web_ocpp_handler, info,
+                                              [Pid, [peer_host, peer_port]])).
+
+%% Plain HTTP connections (e.g. an idle keep-alive connection, or one that
+%% is being authenticated) were listed as OCPP connections. Asking them for
+%% their details timed out, which broke `rabbitmqctl list_web_ocpp_connections`.
+http_clients_are_not_listed_as_connections(Config) ->
+    Cid = cid(Config),
+    {ok, Idle} = gen_tcp:connect("127.0.0.1", rabbit_web_ocpp_test_util:port(Config, 0), []),
+    try
+        _WS = connect(Config, Cid),
+        ?assertEqual(1, length(connection_pids(Config))),
+        {ok, Out} = rabbit_ct_broker_helpers:rabbitmqctl(
+                      Config, 0, ["list_web_ocpp_connections", "client_id"], 60000),
+        ?assertNotEqual(nomatch, binary:match(rabbit_data_coercion:to_binary(Out), Cid))
+    after
+        gen_tcp:close(Idle)
+    end.
+
+%% Unlike amq.topic, the plugin's exchange does not exist by default: it must
+%% also be declared in vhosts created later, so that workers can bind to it.
+exchange_is_declared_in_new_vhosts(Config) ->
+    Vhost = <<"created-later">>,
+    ok = rabbit_ct_broker_helpers:add_vhost(Config, Vhost),
+    try
+        XName = rabbit_misc:r(Vhost, exchange, rabbit_web_ocpp_test_util:exchange(Config)),
+        rabbit_ct_helpers:await_condition(
+          fun() ->
+                  element(1, rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_exchange,
+                                                          lookup, [XName])) =:= ok
+          end, 5000)
+    after
+        rabbit_ct_broker_helpers:delete_vhost(Config, Vhost)
+    end.
+
+%% Prometheus metrics: consumers were never decremented, received and
+%% delivered messages never counted.
+global_counters_track_ocpp_traffic(Config) ->
+    Cid = cid(Config),
+    declare_worker_queue(Config, <<"workers">>, <<"ocpp16.Heartbeat.req">>),
+    Before = counters(Config),
+    [begin
+         WS = connect(Config, Cid),
+         call(WS, <<"Heartbeat">>, #{}),
+         publish_to_cp(Config, Cid, [3, <<"cp-1">>, #{}]),
+         ?assertMatch([3, <<"cp-1">>, _], recv(WS)),
+         rfc6455_client:close(WS),
+         wait_for_connections(Config, 0)
+     end || _ <- lists:seq(1, 3)],
+    After = counters(Config),
+    ?assertEqual(maps:get(consumers, Before), maps:get(consumers, After)),
+    ?assertEqual(maps:get(messages_received_total, Before) + 3,
+                 maps:get(messages_received_total, After)),
+    ?assertEqual(maps:get(messages_delivered_total, Before) + 3,
+                 maps:get(messages_delivered_total, After)).
+
+%% Publishes did not use credit flow: a charge point could flood the mailbox
+%% of a queue that cannot keep up.
+slow_queue_throttles_charge_point(Config) ->
+    declare_worker_queue(Config, <<"workers">>, <<"ocpp16.DataTransfer.req">>),
+    QPid = queue_pid(Config, <<"workers">>),
+    WS = connect(Config, cid(Config)),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, sys, suspend, [QPid]),
+    N = 2000,
+    Data = binary:copy(<<"x">>, 1000),
+    try
+        [call(WS, <<"DataTransfer">>, #{<<"vendorId">> => <<"v">>, <<"data">> => Data})
+         || _ <- lists:seq(1, N)],
+        timer:sleep(3000),
+        {message_queue_len, Len} = rabbit_ct_broker_helpers:rpc(Config, 0, erlang, process_info,
+                                                                [QPid, message_queue_len]),
+        ct:pal("Queue process mailbox: ~b messages", [Len]),
+        ?assert(Len < N div 2)
+    after
+        rabbit_ct_broker_helpers:rpc(Config, 0, sys, resume, [QPid])
+    end,
+    %% Nothing is lost.
+    rabbit_ct_helpers:await_condition(
+      fun() -> message_count(Config, <<"workers">>) =:= N end, 60000).
+
+%% -------------------------------------------------------------------
+%% TLS listener
+%% -------------------------------------------------------------------
+
+%% Security profile 2: TLS with Basic auth.
+tls_basic_auth(Config) ->
+    WS = connect(Config, cid(Config), #{tls => []}),
+    [Pid] = connection_pids(Config),
+    ?assertEqual([{ssl, true}, {auth_mechanism, <<"BASIC">>}],
+                 rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_web_ocpp_handler, info,
+                                              [Pid, [ssl, auth_mechanism]])),
+    ?assert(rabbit_web_ocpp_test_util:is_open(WS)).
+
+%% Security profile 3: the client certificate identifies the charge point.
+%% The test certificates' common name is the host name.
+tls_client_certificate(Config) ->
+    Cid = hostname(),
+    rabbit_web_ocpp_test_util:ensure_user(Config, Cid),
+    _WS = connect(Config, Cid, #{tls => client_cert_opts(Config), user => none,
+                                 create_user => false}),
+    [Pid] = connection_pids(Config),
+    ?assertEqual([{auth_mechanism, <<"MTLS">>}, {user, Cid}],
+                 rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_web_ocpp_handler, info,
+                                              [Pid, [auth_mechanism, user]])).
+
+tls_client_certificate_must_match_client_id(Config) ->
+    {_, Status} = try_connect(Config, cid(Config), #{tls => client_cert_opts(Config)}),
+    ?assertEqual(401, Status).
+
+tls_only_user_is_rejected_on_plain_listener(Config) ->
+    Cid = cid(Config),
+    rabbit_web_ocpp_test_util:ensure_user(Config, Cid),
+    ok = rabbit_ct_broker_helpers:set_user_tags(Config, 0, Cid, [tlsonly]),
+    {_, Status} = try_connect(Config, Cid, #{create_user => false}),
+    ?assertEqual(401, Status),
+    _WS = connect(Config, Cid, #{tls => [], create_user => false}).
+
 %% The offline status published while the node shuts down is persistent
 %% and survives the restart.
 f15_offline_status_survives_node_restart(Config) ->
@@ -614,6 +868,47 @@ prop(Key, Props) ->
         [V] -> V;
         [] -> undefined
     end.
+
+counters(Config) ->
+    Overview = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_global_counters, overview, []),
+    Protocol = maps:get(#{protocol => ocpp16}, Overview),
+    Classic = maps:get(#{protocol => ocpp16, queue_type => rabbit_classic_queue}, Overview),
+    #{consumers => maps:get(consumers, Protocol),
+      messages_received_total => maps:get(messages_received_total, Protocol),
+      messages_delivered_total => maps:get(messages_delivered_total, Classic)}.
+
+queue_pid(Config, QName) ->
+    {ok, Q} = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_amqqueue, lookup,
+                                           [rabbit_misc:r(<<"/">>, queue, QName)]),
+    amqqueue:get_pid(Q).
+
+%% PROXY protocol v1 header of a client at 192.168.1.5:40000.
+proxy_header(Config) ->
+    Port = rabbit_web_ocpp_test_util:port(Config, 0),
+    iolist_to_binary(["PROXY TCP4 192.168.1.5 127.0.0.1 40000 ", integer_to_list(Port), "\r\n"]).
+
+hostname() ->
+    {ok, Hostname} = inet:gethostname(),
+    list_to_binary(Hostname).
+
+client_cert_opts(Config) ->
+    CertsDir = ?config(rmq_certsdir, Config),
+    [{certfile, filename:join([CertsDir, "client", "cert.pem"])},
+     {keyfile, filename:join([CertsDir, "client", "key.pem"])}].
+
+consume_stream(Config, QName, N) ->
+    Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    #'basic.qos_ok'{} = amqp_channel:call(Ch, #'basic.qos'{prefetch_count = N}),
+    #'basic.consume_ok'{} =
+        amqp_channel:subscribe(Ch, #'basic.consume'{queue = QName,
+                                                    arguments = [{<<"x-stream-offset">>, longstr, <<"first">>}]},
+                               self()),
+    Frames = [receive {#'basic.deliver'{}, #amqp_msg{payload = P}} -> json:decode(P)
+              after 10000 -> ct:fail({stream_delivery_missing, I})
+              end || I <- lists:seq(1, N)],
+    amqp_connection:close(Conn),
+    Frames.
 
 %% Stands in for a connection with the same client ID on the other side of
 %% a healed network partition. It records what it is sent.

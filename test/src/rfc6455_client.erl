@@ -7,7 +7,7 @@
 
 -module(rfc6455_client).
 
--export([new/2, new/3, new/4, new/5, open/1, recv/1, recv/2, send/2, send_binary/2, close/1, close/2]).
+-export([new/2, new/3, new/4, new/5, new/6, open/1, recv/1, recv/2, send/2, send_binary/2, close/1, close/2]).
 
 -record(state, {host, port, addr, path, ppid, socket, data, phase, transport}).
 
@@ -23,6 +23,9 @@ new(WsUrl, PPid, AuthInfo, Protocols) ->
     new(WsUrl, PPid, AuthInfo, Protocols, <<>>).
 
 new(WsUrl, PPid, AuthInfo, Protocols, TcpPreface) ->
+    new(WsUrl, PPid, AuthInfo, Protocols, TcpPreface, []).
+
+new(WsUrl, PPid, AuthInfo, Protocols, TcpPreface, TlsOpts) ->
     crypto:start(),
     application:ensure_all_started(ssl),
     {Transport, Url} = case WsUrl of
@@ -46,7 +49,7 @@ new(WsUrl, PPid, AuthInfo, Protocols, TcpPreface) ->
                    ppid = PPid,
                    transport = Transport},
     spawn_link(fun () ->
-                  start_conn(State, AuthInfo, Protocols, TcpPreface)
+                  start_conn(State, AuthInfo, Protocols, TcpPreface, TlsOpts)
           end).
 
 open(WS) ->
@@ -100,11 +103,12 @@ close(WS, WsReason) ->
 
 %% --------------------------------------------------------------------------
 
-start_conn(State = #state{transport = Transport}, AuthInfo, Protocols, TcpPreface) ->
+start_conn(State = #state{transport = Transport}, AuthInfo, Protocols, TcpPreface, TlsOpts0) ->
+    TlsOpts1 = TlsOpts0 ++ [{verify, verify_none}],
     {ok, Socket} = case TcpPreface of
         <<>> ->
             TlsOpts = case Transport of
-                ssl -> [{verify, verify_none}];
+                ssl -> TlsOpts1;
                 _   -> []
               end,
             Transport:connect(State#state.host, State#state.port,
@@ -116,7 +120,7 @@ start_conn(State = #state{transport = Transport}, AuthInfo, Protocols, TcpPrefac
             gen_tcp:send(Socket0, TcpPreface),
             case Transport of
                 gen_tcp -> {ok, Socket0};
-                ssl -> Transport:connect(Socket0, [{verify, verify_none}])
+                ssl -> Transport:connect(Socket0, TlsOpts1)
             end
     end,
 
