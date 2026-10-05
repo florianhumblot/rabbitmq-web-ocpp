@@ -66,16 +66,47 @@ when building plugins from source.
 ## How It Works
 
 The communication flow is straightforward: 
-1. Connect your EVSE to the following OCPP endpoint: `ws://127.0.0.1:19520/ocpp/%2F/` for `/` (default) vhost running on docker or adjust the URL accordingly.
-2. Messages arriving from the EVSE are sent to the configured exchange (default: `amq.topic`) with `correlation_id` set to the OCPP `messageId` and `reply_to` set to the EVSE ID.
-3. Configure backend worker routing on the CSMS side by creating a queue bound to the same exchange. Use routing keys in the format: `protocolver.actionname.req/conf/error`. Examples: `ocpp16.BootNotification.req`, `ocpp16.Heartbeat.conf`, `ocpp201.StatusNotification.req`. Common patterns include `ocpp16.#` for all v1.6 traffic or `*.StartTransaction.#` for billing-specific workers. See the [RabbitMQ Topics tutorial](https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange) for details.
+1. Connect your EVSE to the following OCPP endpoint: `ws://127.0.0.1:19520/ocpp/%2F/<EVSE ID>` for `/` (default) vhost running on docker or adjust the URL accordingly. The EVSE authenticates with HTTP Basic auth using its EVSE ID as username (OCPP security profiles 1 and 2), or with a client certificate whose identity is the EVSE ID (security profile 3).
+2. Messages arriving from the EVSE are published as persistent messages to the configured exchange (default: `ocpp`, a durable topic exchange the plugin declares) with `correlation_id` set to the OCPP `messageId` and `reply_to` set to the EVSE ID.
+3. Configure backend worker routing on the CSMS side by creating a queue bound to the same exchange. Use routing keys in the format: `protocolver.actionname.req/conf/error`. Examples: `ocpp16.BootNotification.req`, `ocpp16.GetConfiguration.conf`, `ocpp201.StatusNotification.req`. Answers of the EVSE to commands of the CSMS carry the action of the command, e.g. the answer to a `RemoteStartTransaction` is routed as `ocpp16.RemoteStartTransaction.conf` (or `.error`) and its AMQP `type` property is `RemoteStartTransaction`. Common patterns include `ocpp16.#` for all v1.6 traffic or `*.StartTransaction.#` for billing-specific workers. See the [RabbitMQ Topics tutorial](https://www.rabbitmq.com/tutorials/tutorial-five-python#topic-exchange) for details.
 4. After processing and validating the message in your async worker, build a valid OCPP Response (or error) and publish it back to the same exchange with the routing key set to the EVSE ID and `correlation_id` set to the original request's OCPP `messageId`. The plugin handles sending this message back to the EVSE via the correct WebSocket connection.
-5. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
-6. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
+5. Commands of the CSMS (CALLs) are published the same way. As OCPP-J requires, the plugin sends an EVSE one CALL at a time: the next one once the EVSE answered the previous one or `web_ocpp.call_timeout` expired. A CALL stays unacknowledged in the EVSE's queue until then, so it is delivered again if the EVSE disconnects before answering. Commands for an EVSE that stays offline longer than `web_ocpp.queue_message_ttl` are dropped.
+6. A CALL of the EVSE that no queue is bound for is answered with a `NotImplemented` CALLERROR right away.
+7. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
+8. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
+
+EVSE IDs may only contain letters, digits and `-_~!$&'()+,;=:@`, at most 48 characters (`web_ocpp.max_client_id_length`): the EVSE ID is used as binding key on a topic exchange, so `.`, `*` and `#` are rejected.
+
+### Configuration
+
+| Setting (`rabbitmq.conf`) | Default | |
+|---|---|---|
+| `web_ocpp.exchange` | `ocpp` | Exchange the plugin publishes to and binds EVSE queues to. Declared as a durable topic exchange when missing. |
+| `web_ocpp.protocols.<n>` | `ocpp1.6`, `ocpp2.0`, `ocpp2.0.1`, `ocpp2.1` | Accepted OCPP-J versions. |
+| `web_ocpp.username_must_match_client_id` | `true` | Require the Basic auth username to be the EVSE ID. |
+| `web_ocpp.max_client_id_length` | `48` | Longest accepted EVSE ID. |
+| `web_ocpp.queue_type` | `classic` | Type of new EVSE queues (`ocpp.<EVSE ID>`). Use `quorum` so that EVSEs can reconnect to another node when the node of their queue is down. |
+| `web_ocpp.queue_message_ttl` | `300000` | Message TTL (ms) of new EVSE queues, `none` to keep commands forever. |
+| `web_ocpp.queue_expires` | `604800000` | Queues of EVSEs that do not connect for this long (ms) are deleted, `none` to keep them. |
+| `web_ocpp.prefetch_count` | `10` | Unacknowledged messages per EVSE queue. |
+| `web_ocpp.call_timeout` | `30000` | How long (ms) a CALL sent to an EVSE may stay unanswered. |
+| `web_ocpp.permission_cache_ttl` | `60000` | How long (ms) connections cache permission checks. |
+| `web_ocpp.ws_opts.idle_timeout` | `60000` | WebSocket idle timeout (ms). |
+| `web_ocpp.ws_opts.ping_interval` | half the idle timeout | Interval (ms) of the WebSocket pings the plugin sends, `0` disables them. EVSEs answer with pongs, which keeps them connected. |
+| `web_ocpp.ws_opts.max_frame_size` | `1048576` | Largest accepted WebSocket frame (bytes). |
+
+Queue arguments only apply to newly declared EVSE queues: use a [policy](https://www.rabbitmq.com/docs/policies) for existing ones.
+
+#### Upgrading
+
+* The default exchange changed from `amq.topic` to `ocpp`, so that MQTT and STOMP clients publishing to `amq.topic` cannot reach EVSEs. Set `web_ocpp.exchange = amq.topic` to keep the previous behaviour.
+* Answers of EVSEs to commands are routed as `<version>.<action>.conf|error` instead of `<version>.response.conf|error`. Only answers that arrive after `web_ocpp.call_timeout` still use `response`.
+* The Basic auth username must be the EVSE ID. Set `web_ocpp.username_must_match_client_id = false` for users shared by several EVSEs.
+* EVSE IDs with characters outside the set above are rejected, as are the subprotocols `ocpp1.2` and `ocpp1.5` (which only exist as SOAP).
 
 ## Offline Detection
 
-Whenever an established charge point connection terminates — clean WebSocket close, TCP drop, crash or broker shutdown — the plugin publishes one final synthetic `StatusNotification` CALL on behalf of the charge point, so backend workers learn about the disconnect through the same channel as any other OCPP traffic. The payload marks the whole charge point (`connectorId` 0) unavailable, shaped for the protocol version the charge point was connected with:
+Whenever an established charge point connection terminates — clean WebSocket close, TCP drop or broker shutdown — the plugin publishes one final synthetic `StatusNotification` CALL on behalf of the charge point, so backend workers learn about the disconnect through the same channel as any other OCPP traffic. The payload marks the whole charge point (`connectorId` 0) unavailable, shaped for the protocol version the charge point was connected with:
 
 OCPP 1.x:
 
@@ -89,9 +120,22 @@ OCPP 2.x:
 [2,"83c2c788-712b-18a4-7456-29a4586ddb4a","StatusNotification",{"connectorId":0,"connectorStatus":"Unavailable","customData":{"vendorErrorCode":"Offline","vendorId":"rabbitmq"},"evseId":0,"timestamp":"2026-07-17T13:10:27Z"}]
 ```
 
+No offline status is published when a connection is replaced by a newer connection of the same charge point, which is online. Nothing can be published when a node crashes (e.g. on `kill -9` or power loss): use the event exchange described below, or heartbeat supervision on the CSMS side, to detect that.
+
 Workers can recognize the synthetic frame by `vendorErrorCode` or `vendorId` — e.g. to skip sending the CALLRESULT, which would otherwise sit in the disconnected charge point's queue until it reconnects and be discarded because of an unknown `messageId`.
 
 Alternatively (or additionally — e.g. to also detect chargers coming *online* - if you don't do this by StatusNotification), enable the [`rabbitmq_event_exchange`](https://www.rabbitmq.com/docs/event-exchange) plugin and bind a queue to the internal `amq.rabbitmq.event` topic exchange for the `connection.created` and `connection.closed` routing keys. Connections handled by this plugin carry a `protocol` header of `{'WS OCPP', ...}` and a `client_id` header with the EVSE ID, so consumers can filter out non-OCPP connections (management UI, shovels, backend workers) and map events back to charge points.
+
+## Tests
+
+The test suites run against a RabbitMQ source tree, like all plugins:
+
+``` bash
+git clone --branch v4.2.7 --depth 1 https://github.com/rabbitmq/rabbitmq-server.git
+cp -r rabbitmq-web-ocpp rabbitmq-server/deps/rabbitmq_web_ocpp
+cd rabbitmq-server/deps/rabbitmq_web_ocpp
+make ct-config_schema ct-ocpp ct-ocpp_cluster
+```
 
 ## Documentation
 

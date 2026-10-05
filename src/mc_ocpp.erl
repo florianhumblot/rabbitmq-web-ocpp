@@ -32,9 +32,11 @@
 %%--------------------------------------------------------------------
 -spec init(#ocpp_msg{}) -> {#ocpp_msg{}, map()} | error.
 init(Msg = #ocpp_msg{}) ->
+    %% Charge point messages are persistent: a durable queue keeps them
+    %% across broker restarts.
     Anns = #{
         ?ANN_ROUTING_KEYS => [Msg#ocpp_msg.client_id],
-        ?ANN_DURABLE   => false,
+        ?ANN_DURABLE   => true,
         correlation_id => Msg#ocpp_msg.msg_id,
         reply_to       => Msg#ocpp_msg.client_id,
         content_type   => ?CONTENT_TYPE_JSON
@@ -108,7 +110,7 @@ convert_from(_, _, _) ->
 
 %% AMQP 1.0
 convert_to(mc_amqp, #ocpp_msg{payload=P, msg_id=ID, action=A, client_id=CID} = _Msg, Env) ->
-    Header   = #'v1_0.header'{durable = false},
+    Header   = #'v1_0.header'{durable = true},
     Props    = #'v1_0.properties'{
                   correlation_id = ID,
                   subject        = A,
@@ -130,7 +132,7 @@ convert_to(mc_amqpl,
            _Env) ->
     %% 1) Build the basic properties record
     BP = #'P_basic'{
-      delivery_mode   = 1,                % non-persistent
+      delivery_mode   = 2,                % persistent
       correlation_id  = MsgId,            % your OCPP msg_id
       type            = Action,           % maps to 'type' header
       content_type    = ?CONTENT_TYPE_JSON,

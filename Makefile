@@ -10,7 +10,17 @@ define PROJECT_ENV
 	    {num_ssl_acceptors, 10},
 	    {cowboy_opts, []},
 	    {proxy_protocol, false},
-	    {allow_anonymous, false}
+	    {allow_anonymous, false},
+	    {exchange, <<"ocpp">>},
+	    {prefetch_count, 10},
+	    {call_timeout, 30000},
+	    {queue_type, classic},
+	    {queue_message_ttl, 300000},
+	    {queue_expires, 604800000},
+	    {permission_cache_ttl, 60000},
+	    {username_must_match_client_id, true},
+	    {max_client_id_length, 48},
+	    {protocols, [<<"ocpp1.6">>, <<"ocpp2.0">>, <<"ocpp2.0.1">>, <<"ocpp2.1">>]}
 	  ]
 endef
 
@@ -31,7 +41,3 @@ include ../../rabbitmq-components.mk
 include ../../erlang.mk
 
 CT_HOOKS = rabbit_ct_hook
-
-# compile: warnings being treated as errors
-# Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebOcppConnectionsCommand.erl:11:2: behaviour 'Elixir.RabbitMQ.CLI.CommandBehaviour' undefined
-ERLC_OPTS := $(filter-out -Werror,$(ERLC_OPTS))

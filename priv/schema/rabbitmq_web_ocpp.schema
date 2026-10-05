@@ -142,9 +142,6 @@ end}.
     [{datatype, integer}]}.
 {mapping, "web_ocpp.cowboy_opts.max_request_line_length", "rabbitmq_web_ocpp.cowboy_opts.max_request_line_length",
     [{datatype, integer}]}.
-{mapping, "web_ocpp.cowboy_opts.timeout", "rabbitmq_web_ocpp.cowboy_opts.idle_timeout",
-    [{datatype, integer}]}.
-
 %% backwards compatibility
 {mapping, "web_ocpp.cowboy_opts.timeout", "rabbitmq_web_ocpp.cowboy_opts.idle_timeout",
     [{datatype, integer}, {validators, ["non_negative_integer"]}]
@@ -187,6 +184,17 @@ end}.
     [{datatype, integer}, {validators, ["non_negative_integer"]}]
 }.
 
+%% Interval (ms) of the WebSocket pings the server sends. Charge points
+%% answer with pongs, which keeps connections of charge points that send
+%% less often than the idle timeout open. Defaults to half the idle timeout,
+%% 0 disables pings.
+%%
+%% {ws_ping_interval, 30000}
+
+{mapping, "web_ocpp.ws_opts.ping_interval", "rabbitmq_web_ocpp.ws_ping_interval",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]
+}.
+
 %% Whether or not to enable proxy protocol support.
 %%
 %% {proxy_protocol, false}
@@ -221,11 +229,73 @@ end}.
 {mapping, "web_ocpp.prefetch_count", "rabbitmq_web_ocpp.prefetch_count",
     [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
 
+%% How long (ms) a CALL sent to a charge point may stay unanswered. Only
+%% one CALL is outstanding at a time [OCPP-J]: the next one is sent once
+%% the charge point answered or this timeout expired.
 %%
-%% File Handle Cache
-%%
+%% {call_timeout, 30000}
 
-{mapping, "web_ocpp.use_file_handle_cache", "rabbitmq_web_ocpp.use_file_handle_cache",
-    [
-        {datatype, {enum, [true, false]}}
-    ]}.
+{mapping, "web_ocpp.call_timeout", "rabbitmq_web_ocpp.call_timeout",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+
+%% Type of newly declared station queues (ocpp.<client_id>). Quorum queues
+%% are replicated and stay available when a node goes down.
+%%
+%% {queue_type, classic}
+
+{mapping, "web_ocpp.queue_type", "rabbitmq_web_ocpp.queue_type",
+    [{datatype, {enum, [classic, quorum]}}]}.
+
+%% Message TTL (ms) of newly declared station queues: commands for a
+%% station that is offline for longer are dropped. 'none' keeps them.
+%%
+%% {queue_message_ttl, 300000}
+
+{mapping, "web_ocpp.queue_message_ttl", "rabbitmq_web_ocpp.queue_message_ttl",
+    [{datatype, [{enum, [none]}, integer]}]}.
+
+%% Expiry (ms) of newly declared station queues: the queue of a station that
+%% does not connect for this long is deleted. 'none' keeps them.
+%%
+%% {queue_expires, 604800000}
+
+{mapping, "web_ocpp.queue_expires", "rabbitmq_web_ocpp.queue_expires",
+    [{datatype, [{enum, [none]}, integer]}]}.
+
+%% How long (ms) a connection caches the results of permission checks.
+%%
+%% {permission_cache_ttl, 60000}
+
+{mapping, "web_ocpp.permission_cache_ttl", "rabbitmq_web_ocpp.permission_cache_ttl",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+
+%% Whether the HTTP Basic auth username must be the station's client ID,
+%% as OCPP security profiles 1 and 2 require.
+%%
+%% {username_must_match_client_id, true}
+
+{mapping, "web_ocpp.username_must_match_client_id", "rabbitmq_web_ocpp.username_must_match_client_id",
+    [{datatype, {enum, [true, false]}}]}.
+
+%% Longest accepted client ID.
+%%
+%% {max_client_id_length, 48}
+
+{mapping, "web_ocpp.max_client_id_length", "rabbitmq_web_ocpp.max_client_id_length",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+
+%% Accepted OCPP-J versions (WebSocket subprotocols), e.g.
+%%
+%% web_ocpp.protocols.1 = ocpp1.6
+%% web_ocpp.protocols.2 = ocpp2.0.1
+
+{mapping, "web_ocpp.protocols.$name", "rabbitmq_web_ocpp.protocols",
+    [{datatype, {enum, ['ocpp1.6', 'ocpp2.0', 'ocpp2.0.1', 'ocpp2.1']}}]}.
+
+{translation, "rabbitmq_web_ocpp.protocols",
+fun(Conf) ->
+    case cuttlefish_variable:filter_by_prefix("web_ocpp.protocols", Conf) of
+        [] -> cuttlefish:unset();
+        Settings -> [atom_to_binary(V) || {_, V} <- Settings]
+    end
+end}.

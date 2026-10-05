@@ -25,7 +25,8 @@
     terminate/3
 ]).
 
--export([info/2]).
+-export([info/2,
+         conserve_resources/3]).
 
 %% cowboy_sub_protocol
 -export([upgrade/4,
@@ -42,6 +43,9 @@
           socket :: {rabbit_proxy_socket, any(), any()} | rabbit_net:socket(),
           proc_state :: rabbit_web_ocpp_processor:state(),
           connection_state = running :: running | blocked,
+          %% Resource alarms this connection is blocked by.
+          blocked_by = sets:new([{version, 2}]) :: sets:set(rabbit_alarm:resource_alarm_source()),
+          ping_interval = infinity :: timeout(),
           stats_timer :: option(rabbit_event:state()),
           vhost :: rabbit_types:vhost(),
           client_id :: client_id(),
@@ -98,10 +102,12 @@ init(Req, Opts) ->
             %% because we don't trust the PROXY protocol, maybe @TODO.
             IsSsl = cowboy_req:scheme(Req) =:= <<"https">>,
             Result = maybe
+                ok ?= check_client_id(ClientId, PeerIp),
                 ok ?= check_vhost_exists(Vhost, ClientId, PeerIp),
                 ok ?= check_vhost_alive(Vhost),
                 {ok, ProtoVer, Req1} ?= pick_protocol(Req, ClientId),
                 {ok, Username1, Password1} ?= check_credentials(ClientId, Username0, Password0, SslLoginName, PeerIp),
+                ok ?= check_username_matches_client_id(ClientId, Username0, SslLoginName, PeerIp),
                 {ok, User0} ?= check_user_login(Vhost, Username1, Password1, ClientId, PeerIp, IsSsl),
                 ok ?= check_user_loopback(User0, PeerIp),
                 ok ?= check_tls_only(User0, IsSsl, PeerIp),
@@ -122,7 +128,9 @@ init(Req, Opts) ->
                     %% permessage-deflate connection holds two zlib contexts for
                     %% its whole lifetime. When enabled, ?DEFAULT_DEFLATE_OPTS is
                     %% applied unless the operator supplies deflate_opts.
-                    WsOpts1     = maps:merge(#{compress => false, idle_timeout => IdleMs}, WsOpts0),
+                    WsOpts1     = maps:merge(#{compress => false,
+                                               idle_timeout => IdleMs,
+                                               max_frame_size => ?DEFAULT_MAX_FRAME_SIZE}, WsOpts0),
                     WsOpts      = case WsOpts1 of
                                       #{compress := true} ->
                                           maps:merge(#{deflate_opts => ?DEFAULT_DEFLATE_OPTS}, WsOpts1);
@@ -133,9 +141,12 @@ init(Req, Opts) ->
                     State = #state{socket = ProxyInfo, proto_ver = ProtocolVer, vhost = V2,
                                    user = User, authz_ctx = AuthzCtx1,
                                    client_id = CId, idle_timeout = IdleSec,
+                                   ping_interval = ping_interval(IdleMs),
                                    ssl_login_name = SslLoginName,
                                    auth_mechanism = auth_mechanism(Username0, SslLoginName)},
                     {?MODULE, Req2, State, WsOpts};
+                {error, {invalid_client_id, Msg}} ->
+                    {ok, cowboy_req:reply(400, #{<<"connection">> => <<"close">>}, Msg, Req), RejState};
                 {error, bad_vhost} ->
                     {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), RejState};
                 {error, vhost_down} ->
@@ -184,11 +195,15 @@ websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = Clien
                 {ok, ProcState} ->
                     ?LOG_INFO("Accepted Web OCPP connection ~ts for client ID ~ts",
                                 [ConnName, ClientId]),
-                    FinalState = State2#state{proc_state = ProcState},
+                    Alarms = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
+                    State3 = State2#state{proc_state = ProcState,
+                                          blocked_by = sets:from_list(Alarms, [{version, 2}])},
                     process_flag(trap_exit, true),
+                    schedule_ping(State3),
                     % `ensure_stats_timer` is needed to trigger the initial stats collection
                     % and update the connection state to "running" in the management UI
-                    {[], ensure_stats_timer(FinalState), hibernate};
+                    {Cmds, FinalState} = control_throttle(ensure_stats_timer(State3)),
+                    {Cmds, FinalState, hibernate};
                 {error, Reason} ->
                     ?LOG_ERROR("Rejected Web OCPP connection ~ts: ~p", [ConnName, Reason]),
                     self() ! {stop, ?CLOSE_PROTOCOL_ERROR, connect_packet_rejected},
@@ -202,41 +217,21 @@ websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = Clien
     {cowboy_websocket:commands(), State} |
     {cowboy_websocket:commands(), State, hibernate}.
 %% Handle text (JSON) frames (pass to processor)
-websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = ClientId, proc_state = ProcState0}) ->
-    %% Call processor module to handle decoding and validation first
+websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = ClientId,
+                                              proc_state = ProcState0}) ->
     case rabbit_web_ocpp_processor:handle_text_frame(Data, ProcState0) of
-        {ok, McOcpp, ProcState1} ->
-            % Decoding and validation successful, now process the incoming message
-            % Pass both the decoded list and the original raw binary
-            case rabbit_web_ocpp_processor:process_incoming(McOcpp, ProcState1) of
-                {ok, NewProcState} ->
-                    % Message successfully published to the exchange
-                    ?LOG_DEBUG("Web OCPP message processed and published for ~p (~p)",
-                               [ClientId, ConnName]),
-                    NewState = State#state{proc_state = NewProcState},
-                    {[], ensure_stats_timer(NewState), hibernate};
-                {error, Reason, _ProcState} ->
-                    % Publish permission denied or other processing error
-                    ?LOG_ERROR("OCPP message processing failed for ~p (~p). Reason: ~tp",
-                               [ClientId, ConnName, Reason]),
-                    % Use access_refused specific code if possible, otherwise protocol error
-                    CloseCode = case Reason of
-                                    access_refused -> ?CLOSE_POLICY_VIOLATION;
-                                    _ -> ?CLOSE_PROTOCOL_ERROR
-                                end,
-                    stop(State, CloseCode, Reason)
-            end;
-        {error, Reason} ->
-            % Decoding or validation failed
-            ?LOG_ERROR("OCPP message handling failed (decode/validate) for ~p (~p). Reason: ~tp",
-                       [ClientId, ConnName, Reason]),
-            %% Determine close code based on reason
+        {ok, ProcState, Frames} ->
+            {Frames, ensure_stats_timer(State#state{proc_state = ProcState}), hibernate};
+        {error, Reason, ProcState} ->
+            ?LOG_WARNING("Web OCPP closing connection ~ts of client ID ~ts: ~p",
+                         [ConnName, ClientId, Reason]),
             CloseCode = case Reason of
-                            <<"Invalid JSON">> -> ?CLOSE_INVALID_PAYLOAD;
-                            <<"Invalid OCPP message structure">> -> ?CLOSE_PROTOCOL_ERROR; % Or maybe 1007?
-                            _ -> ?CLOSE_PROTOCOL_ERROR % Default to protocol error
+                            invalid_json -> ?CLOSE_INVALID_PAYLOAD;
+                            invalid_message -> ?CLOSE_PROTOCOL_ERROR;
+                            access_refused -> ?CLOSE_POLICY_VIOLATION;
+                            _ -> ?CLOSE_INTERNAL_ERROR
                         end,
-            stop(State, CloseCode, Reason)
+            stop(State#state{proc_state = ProcState}, CloseCode, Reason)
     end;
 %% Silently ignore ping and pong frames as Cowboy will automatically reply to ping frames.
 websocket_handle({Ping, _}, State)
@@ -261,45 +256,62 @@ websocket_info({stop, CloseCode, Error}, State) ->
     stop(State, CloseCode, Error);
 websocket_info({'EXIT', _, _}, State) ->
     stop(State);
-websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}},
-               State = #state{proc_state = PState0}) ->
-    case rabbit_web_ocpp_processor:handle_info(QueueEvent, PState0) of
-        {ok, PState, Frames} ->
-            NewState = State#state{proc_state = PState},
-            {Frames, NewState, hibernate};
-        {error, Reason, PState} ->
-            ?LOG_ERROR("Web OCPP connection ~p failed to handle queue event: ~p",
-                       [State#state.conn_name, Reason]),
-            stop(State#state{proc_state = PState})
-    end;
+websocket_info({conserve_resources, Source, Conserve},
+               State = #state{blocked_by = BlockedBy0}) ->
+    BlockedBy = case Conserve of
+                    true -> sets:add_element(Source, BlockedBy0);
+                    false -> sets:del_element(Source, BlockedBy0)
+                end,
+    {Cmds, State1} = control_throttle(State#state{blocked_by = BlockedBy}),
+    {Cmds, State1, hibernate};
+websocket_info(ping, State) ->
+    %% Charge points answer pings with pongs, which resets the idle timeout:
+    %% connected charge points that send little are not disconnected.
+    schedule_ping(State),
+    {[ping], State, hibernate};
+websocket_info({'$gen_cast', QueueEvent = {queue_event, _, _}}, State) ->
+    handle_processor_result(
+      rabbit_web_ocpp_processor:handle_info(QueueEvent, State#state.proc_state), State);
+websocket_info({ocpp_call_timeout, _} = Timeout, State) ->
+    handle_processor_result(
+      rabbit_web_ocpp_processor:handle_info(Timeout, State#state.proc_state), State);
 websocket_info({'$gen_cast', {duplicate_id}},
                State = #state{client_id = ClientId,
                               conn_name = ConnName}) ->
     ?LOG_WARNING("Web OCPP disconnecting a client with duplicate ID '~s' (~p)",
                  [ClientId, ConnName]),
-    defer_close(?CLOSE_NORMAL),
-    {[], State};
+    yield_to_newer_connection(State);
 %% pg group membership events, see rabbit_web_ocpp_processor:register_client_id/2.
-%% Observing the join of another connection with the same client ID means this
-%% connection is the older one and must yield ("last connection wins").
-websocket_info({Ref, join, _PgGroup, Pids},
-               State = #state{client_id = ClientId,
-                              conn_name = ConnName})
+%% Usually the newer connection kicks the older one directly. When two
+%% connections with the same client ID see each other's join instead (after
+%% a network partition heals), either could be the newer one: tell the other
+%% when this one connected, and the older one yields.
+websocket_info({Ref, join, _PgGroup, Pids}, State = #state{proc_state = PState})
   when is_reference(Ref) ->
-    case Pids -- [self()] of
-        [] ->
+    case {Pids -- [self()], PState} of
+        {Others, _} when Others =:= [] orelse PState =:= undefined ->
             %% Our own join, reported because the monitor is
             %% installed before the group is joined.
             {[], State, hibernate};
-        _ ->
-            %% Safety net for a lost direct {duplicate_id} kick (e.g. after
-            %% a network partition heals): usually the kick arrives first
-            %% and this connection is already closing.
-            ?LOG_DEBUG("Web OCPP observed the join of a newer connection with "
-                       "the same client ID '~s', closing (~p)",
-                 [ClientId, ConnName]),
-            defer_close(?CLOSE_NORMAL),
-            {[], State}
+        {Others, _} ->
+            ConnectedAt = rabbit_web_ocpp_processor:connected_at(PState),
+            [gen_server:cast(Pid, {duplicate_id_check, self(), ConnectedAt}) || Pid <- Others],
+            {[], State, hibernate}
+    end;
+websocket_info({'$gen_cast', {duplicate_id_check, Other, OtherConnectedAt}},
+               State = #state{proc_state = PState,
+                              client_id = ClientId,
+                              conn_name = ConnName})
+  when PState =/= undefined ->
+    ConnectedAt = rabbit_web_ocpp_processor:connected_at(PState),
+    case {ConnectedAt, self()} < {OtherConnectedAt, Other} of
+        true ->
+            ?LOG_WARNING("Web OCPP disconnecting client with ID '~s' (~p): a newer "
+                         "connection with the same client ID exists",
+                         [ClientId, ConnName]),
+            yield_to_newer_connection(State);
+        false ->
+            {[], State, hibernate}
     end;
 websocket_info({Ref, leave, _PgGroup, _Pids}, State)
   when is_reference(Ref) ->
@@ -334,9 +346,9 @@ websocket_info(credential_expired,
     {[], State};
 websocket_info(emit_stats, State) ->
     {[], emit_stats(State), hibernate};
-websocket_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = _Evt,
-               State = #state{}) ->
-    {[], State};
+websocket_info({{'DOWN', _QName}, _MRef, process, _Pid, _Reason} = Evt,
+               State = #state{proc_state = PState}) when PState =/= undefined ->
+    handle_processor_result(rabbit_web_ocpp_processor:handle_down(Evt, PState), State);
 websocket_info({'DOWN', _MRef, process, QPid, _Reason}, State) ->
     rabbit_amqqueue_common:notify_sent_queue_down(QPid),
     {[], State, hibernate};
@@ -380,6 +392,88 @@ terminate(Reason, _Request, Opts) ->
     ok.
 
 %% Internal.
+
+handle_processor_result({ok, PState, Frames}, State) ->
+    {Frames, State#state{proc_state = PState}, hibernate};
+handle_processor_result({stop, Reason, PState}, State = #state{conn_name = ConnName}) ->
+    ?LOG_WARNING("Web OCPP closing connection ~ts: ~p", [ConnName, Reason]),
+    stop(State#state{proc_state = PState}, ?CLOSE_INTERNAL_ERROR, <<"internal error">>).
+
+%% The charge point is still online, on another connection.
+yield_to_newer_connection(State = #state{proc_state = PState}) ->
+    defer_close(?CLOSE_NORMAL),
+    {[], State#state{proc_state = rabbit_web_ocpp_processor:duplicate_id_kicked(PState)}}.
+
+-spec conserve_resources(pid(),
+                         rabbit_alarm:resource_alarm_source(),
+                         rabbit_alarm:resource_alert()) -> ok.
+conserve_resources(Pid, Source, {_, Conserve, _}) ->
+    Pid ! {conserve_resources, Source, Conserve},
+    ok.
+
+%% Stop reading from the socket while a resource alarm is in effect, so that
+%% charge points cannot publish into a broker that is running out of memory
+%% or disk. TCP back pressure makes them wait.
+control_throttle(State = #state{connection_state = running, blocked_by = BlockedBy}) ->
+    case sets:is_empty(BlockedBy) of
+        true -> {[], State};
+        false -> {[{active, false}], State#state{connection_state = blocked}}
+    end;
+control_throttle(State = #state{connection_state = blocked, blocked_by = BlockedBy}) ->
+    case sets:is_empty(BlockedBy) of
+        true -> {[{active, true}], State#state{connection_state = running}};
+        false -> {[], State}
+    end.
+
+%% By default, ping at half the idle timeout.
+ping_interval(IdleMs) ->
+    case rabbit_web_ocpp_util:get_env(ws_ping_interval) of
+        Interval when is_integer(Interval), Interval > 0 -> Interval;
+        0 -> infinity;
+        _ when is_integer(IdleMs) -> max(1, IdleMs div 2);
+        _ -> infinity
+    end.
+
+schedule_ping(#state{ping_interval = infinity}) ->
+    ok;
+schedule_ping(#state{ping_interval = Interval}) ->
+    _ = erlang:send_after(Interval, self(), ping),
+    ok.
+
+check_client_id(ClientId, PeerIp) ->
+    case rabbit_web_ocpp_util:validate_client_id(ClientId) of
+        ok ->
+            ok;
+        {error, Msg} ->
+            ?LOG_ERROR("OCPP connection refused: ~ts: ~ts",
+                       [Msg, rabbit_web_ocpp_processor:truncate(ClientId)]),
+            auth_attempt_failed(PeerIp, <<>>),
+            {error, {invalid_client_id, Msg}}
+    end.
+
+%% OCPP security profiles 1 and 2 [OCPP 1.6 Security Whitepaper, OCPP 2.0.1
+%% Part 2 A00.FR.203]: the HTTP Basic username is the charge point identity.
+%% Otherwise, valid credentials of one charge point (or a user shared by a
+%% fleet) let anybody take over the session of any charge point. A client
+%% certificate (security profile 3) was already checked against the client ID,
+%% and anonymous logins (web_ocpp.allow_anonymous) send no username.
+check_username_matches_client_id(_ClientId, undefined, _SslLoginName, _PeerIp) ->
+    ok;
+check_username_matches_client_id(_ClientId, _Username, SslLoginName, _PeerIp)
+  when SslLoginName =/= none ->
+    ok;
+check_username_matches_client_id(ClientId, ClientId, none, _PeerIp) ->
+    ok;
+check_username_matches_client_id(ClientId, Username, none, PeerIp) ->
+    case rabbit_web_ocpp_util:get_env(username_must_match_client_id) of
+        false ->
+            ok;
+        true ->
+            ?LOG_ERROR("OCPP login failed: username '~ts' does not match client ID '~ts'",
+                       [Username, ClientId]),
+            auth_attempt_failed(PeerIp, Username),
+            {error, username_mismatch}
+    end.
 
 %% Authentication mechanism shown in the management UI. Mirrors the
 %% decision taken by creds/4: a validated client certificate takes
@@ -427,7 +521,9 @@ pick_protocol(Req, ClientId) ->
             ?LOG_ERROR("Web OCPP: missing subprotocol list for client ~p", [ClientId]),
             {error, invalid_subprotocol};
         ProtoList ->
+            Allowed = rabbit_web_ocpp_util:allowed_protocols(),
             case [ {P, ?OCPP_PROTO_TO_ATOM(P)} || P <- ProtoList,
+                                             lists:member(P, Allowed),
                                              ?OCPP_PROTO_TO_ATOM(P) =/= undefined ] of
                 [] ->
                     ?LOG_ERROR("Web OCPP: no supported ocppX.X subprotocol in ~p for client ~p",

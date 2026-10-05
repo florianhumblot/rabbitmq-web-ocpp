@@ -12,7 +12,7 @@ from ocpp.v16.enums import Action, RegistrationStatus
 
 from amqp_charge_point import AmqpChargePoint
 
-EXCHANGE_NAME = 'amq.topic'
+EXCHANGE_NAME = 'ocpp'
 QUEUE_NAME = 'ocpp.worker'
 
 # Configure logging
@@ -101,7 +101,7 @@ async def main():
 
 if __name__ == '__main__':
     print('Demo OCPP Central System (AMQP-backed, Stateless Worker)')
-    print('Publishing responses to exchange: amq.topic with routing_key = <chargePointId>')
+    print('Publishing responses to exchange: ocpp with routing_key = <chargePointId>')
     print()
 
     asyncio.run(main())

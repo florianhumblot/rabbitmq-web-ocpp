@@ -6,7 +6,48 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/vampirebyte/rabbitmq-web-ocpp
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        PLATFORM:
+          - { RMQREF: "4.2.7", ERLVER: "27", ELXVER: "1.19" }
+          - { RMQREF: "4.3.4", ERLVER: "27", ELXVER: "1.19" }
+    name: "Tests: Broker ${{ matrix.PLATFORM.RMQREF }} - Erlang ${{ matrix.PLATFORM.ERLVER }}"
+    container:
+      image: elixir:${{ matrix.PLATFORM.ELXVER }}-otp-${{ matrix.PLATFORM.ERLVER }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git make build-essential p7zip-full zip
+
+      - name: Check out RabbitMQ
+        run: |
+          git clone --branch "v${{ matrix.PLATFORM.RMQREF }}" --depth 1 \
+            https://github.com/rabbitmq/rabbitmq-server.git /build/rabbitmq-server
+
+      - name: Check out plugin
+        uses: actions/checkout@v6
+        with:
+          path: rabbitmq_web_ocpp
+
+      - name: Run tests
+        run: |
+          cp -r rabbitmq_web_ocpp /build/rabbitmq-server/deps/rabbitmq_web_ocpp
+          cd /build/rabbitmq-server/deps/rabbitmq_web_ocpp
+          make RABBITMQ_VERSION=${{ matrix.PLATFORM.RMQREF }} ct-config_schema ct-ocpp ct-ocpp_cluster
+
+      - name: Store test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct-logs-rmq${{ matrix.PLATFORM.RMQREF }}
+          path: /build/rabbitmq-server/logs/
+
   build:
+    needs: test
     runs-on: ubuntu-24.04
     strategy:
       matrix:

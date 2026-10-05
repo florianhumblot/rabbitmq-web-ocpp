@@ -35,6 +35,8 @@
 -spec start(_, _) -> {ok, pid()}.
 start(_Type, _StartArgs) ->
     init_global_counters(),
+    rabbit_web_ocpp_util:ensure_exchanges(),
+    ok = rabbit_web_ocpp_drainer:start(),
     ocpp_init(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
@@ -44,9 +46,22 @@ prep_stop(State) ->
 
 -spec stop(_) -> ok.
 stop(_State) ->
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TCP_PROTOCOL),
-    _ = rabbit_networking:stop_ranch_listener_of_protocol(?OCPP_TLS_PROTOCOL),
+    %% Gone already when the broker shuts down.
+    _ = catch rabbit_web_ocpp_drainer:stop(),
+    stop_listeners(?OCPP_TCP_PROTOCOL),
+    stop_listeners(?OCPP_TLS_PROTOCOL),
     ok.
+
+%% Stops the listeners and unregisters them, so that they are not listed
+%% anymore and can be started again (e.g. with a new configuration).
+stop_listeners(Protocol) ->
+    Listeners = [L || L = #listener{node = Node} <- rabbit_networking:listeners_of_protocol(Protocol),
+                      Node =:= node()],
+    lists:foreach(
+      fun(L = #listener{ip_address = IP, port = Port, opts = Opts}) ->
+              _ = ranch:stop_listener(rabbit_networking:ranch_ref(L)),
+              rabbit_networking:tcp_listener_stopped(Protocol, Opts, IP, Port)
+      end, Listeners).
 
 init([]) ->
     %% Use a single, cluster-wide process group scope: pg scopes registered
@@ -95,9 +110,7 @@ emit_connection_info(Items, Ref, AggregatorPid, Pids) ->
 %%
 
 init_global_counters() ->
-    lists:foreach(fun init_global_counters/1, [?OCPP_PROTO_V12,
-                                               ?OCPP_PROTO_V15,
-                                               ?OCPP_PROTO_V16,
+    lists:foreach(fun init_global_counters/1, [?OCPP_PROTO_V16,
                                                ?OCPP_PROTO_V20,
                                                ?OCPP_PROTO_V201,
                                                ?OCPP_PROTO_V21]).

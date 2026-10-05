@@ -10,18 +10,19 @@
 
 -export([info/2,
          init/8,
-         process_incoming/2,
          terminate/3,
          handle_info/2,
+         handle_down/2,
          handle_text_frame/2,
+         duplicate_id_kicked/1,
+         connected_at/1,
          format_status/1,
-         proto_version_tuple/1
+         proto_version_tuple/1,
+         truncate/1
         ]).
 
 -export_type([state/0,
               send_fun/0]).
-
--import(rabbit_misc, [maps_put_truthy/3]).
 
 -include_lib("kernel/include/logger.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -31,12 +32,29 @@
 
 %% --- Constants ---
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
--define(DEFAULT_EXCHANGE_NAME, <<"amq.topic">>). % Example exchange name
 -define(CONSUMER_TAG_PREFIX, <<"ocpp.ctag-">>).
--define(QUEUE_KIND, ocpp). % Used for queue naming convention
--define(PREFETCH_COUNT, 1). % Default prefetch for the OCPP queue
 -define(DUPLICATE_ID_KICK_TIMEOUT_MS, 3000). %% Wait for a kicked duplicate client ID to terminate.
 -define(MAX_ACTION_BYTES, 239). %% Room left for the Action string segment of the routing key
+%% OCPP-J limits message IDs to 36 characters.
+-define(MAX_MSG_ID_BYTES, 36).
+%% Charge points reply with the message IDs of the CSMS, which do not have
+%% to be that short. Only bound them by what fits a routing key.
+-define(MAX_RESPONSE_MSG_ID_BYTES, 255).
+%% Connector IDs shown as client properties in the management UI. Bounds
+%% the properties a charge point can create.
+-define(MAX_CONNECTOR_ID, 64).
+-define(MAX_PROPERTY_VALUE_BYTES, 255).
+%% OCPP 1.6 BootNotification.req fields shown as client properties.
+-define(BOOT_NOTIFICATION_PROPS,
+        [<<"chargePointVendor">>, <<"chargePointModel">>, <<"chargePointSerialNumber">>,
+         <<"chargeBoxSerialNumber">>, <<"firmwareVersion">>, <<"iccid">>, <<"imsi">>,
+         <<"meterType">>, <<"meterSerialNumber">>]).
+%% Bytes of client input included in a log line.
+-define(MAX_LOGGED_BYTES, 256).
+%% How long a terminating connection waits for the queues to confirm the
+%% offline status notification.
+-define(OFFLINE_STATUS_CONFIRM_TIMEOUT_MS, 2000).
+-define(OFFLINE_STATUS_CORRELATION, 1).
 
 %% --- Types ---
 
@@ -49,7 +67,6 @@
          authz_ctx :: #{binary() := binary()}
         }).
 
-%% Simplified config compared to MQTT
 -record(cfg, {
         socket :: rabbit_net:socket(),
         send_fun :: send_fun(),
@@ -60,6 +77,7 @@
         exchange :: rabbit_exchange:name(), % Exchange to publish *to* and bind *from*
         queue_name :: rabbit_amqqueue:name(), % The single queue for this client_id
         prefetch :: non_neg_integer(),
+        call_timeout :: pos_integer(),
         conn_name :: option(binary()), % For logging/tracing
         user_prop :: user_property(),
         ip_addr :: inet:ip_address(),
@@ -71,13 +89,31 @@
         connected_at :: pos_integer()
 }).
 
+%% A CALL from the CSMS to the charge point. It stays unacknowledged in the
+%% charge point queue until the charge point answers it or it times out, so
+%% that it is redelivered if the connection drops in the meantime.
+-record(call, {
+        msg_id :: binary(),
+        action :: binary(),
+        qname :: rabbit_amqqueue:name(),
+        qmsg_id :: non_neg_integer(),
+        payload :: binary(),
+        timer :: option(reference())
+}).
+
 -record(state, {
     cfg :: #cfg{},
-    queue_states :: rabbit_queue_type:state(), % State for managing the queue consumer
-    auth_state :: #auth_state{}, % Re-use auth_state structure
-    %% Outbound WebSocket frames accumulated during a single handle_info/2 call,
+    queue_states :: rabbit_queue_type:state(),
+    auth_state :: #auth_state{},
+    %% Outbound WebSocket frames accumulated while handling a single event,
     %% drained and returned to cowboy in one go. Stored in reverse order.
-    pending_frames = [] :: [cowboy_websocket:frame()]
+    pending_frames = [] :: [cowboy_websocket:frame()],
+    %% OCPP-J: one CALL in each direction may be outstanding at a time.
+    outstanding_call :: option(#call{}),
+    held_calls = queue:new() :: queue:queue(#call{}),
+    %% Whether to announce the charge point offline when the connection ends.
+    %% Not when another connection of the same charge point took over.
+    publish_offline = true :: boolean()
 }).
 
 -opaque state() :: #state{}.
@@ -103,155 +139,244 @@ init(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun) ->
             {error, {socket_ends, Reason}}
     end.
 
-process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun, {PeerIp, PeerPort, Ip, Port}) ->
-    case rabbit_net:socket_ends(Socket, inbound) of
-        {ok, SocketEnds} ->
-            {PeerIp, PeerPort, Ip, Port} = SocketEnds;
-        {error, SocketEndsReason} ->
-            {error, {socket_ends, SocketEndsReason}}
-    end,
+process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, SendFun,
+                {PeerIp, PeerPort, Ip, Port}) ->
+    maybe
+        ok = register_client_id(Vhost, ClientId),
+        rabbit_core_metrics:auth_attempt_succeeded(PeerIp, ClientId, ocpp),
 
-    %% 2. Authentication & Authorization
-    Result =
-        maybe
-            ok = register_client_id(Vhost, ClientId),
-            rabbit_core_metrics:auth_attempt_succeeded(PeerIp, ClientId, ocpp),
+        ExchangeName = rabbit_misc:r(Vhost, exchange, rabbit_web_ocpp_util:exchange()),
+        QueueName = queue_name(Vhost, ClientId),
+        {TraceState, ConnName} = init_trace(Vhost, ConnName0),
+        ConnectedAt = os:system_time(millisecond),
 
-            %% 3. Setup Resources
-            ExchangeNameBin = rabbit_data_coercion:to_binary(
-                                application:get_env(?APP_NAME, exchange, ?DEFAULT_EXCHANGE_NAME)),
-            ExchangeName = rabbit_misc:r(Vhost, exchange, ExchangeNameBin),
-            QueueName = queue_name(Vhost, ClientId),
-            Prefetch = application:get_env(?APP_NAME, prefetch_count, ?PREFETCH_COUNT),
-            {TraceState, ConnName} = init_trace(Vhost, ConnName0),
-            ConnectedAt = os:system_time(millisecond),
+        AuthState = #auth_state{user = User, authz_ctx = AuthzCtx},
+        Cfg = #cfg{socket = Socket,
+                   ip_addr = Ip,
+                   port = Port,
+                   peer_ip_addr = PeerIp,
+                   peer_port = PeerPort,
+                   send_fun = SendFun,
+                   vhost = Vhost,
+                   client_id = ClientId,
+                   proto_ver = ProtoVer,
+                   user = User,
+                   user_prop = [],
+                   exchange = ExchangeName,
+                   queue_name = QueueName,
+                   prefetch = rabbit_web_ocpp_util:get_env(prefetch_count),
+                   call_timeout = rabbit_web_ocpp_util:get_env(call_timeout),
+                   conn_name = ConnName,
+                   trace_state = TraceState,
+                   consumer_tag = consumer_tag(ConnectedAt),
+                   connected_at = ConnectedAt},
+        InitialState = #state{cfg = Cfg,
+                              queue_states = rabbit_queue_type:init(),
+                              auth_state = AuthState},
 
-            AuthState = #auth_state{user = User, authz_ctx = AuthzCtx},
-            Cfg = #cfg{socket = Socket,
-                       ip_addr = Ip,
-                       port = Port,
-                       peer_ip_addr = PeerIp,
-                       peer_port = PeerPort,
-                       send_fun = SendFun,
-                       vhost = Vhost,
-                       client_id = ClientId,
-                       proto_ver = ProtoVer,
-                       user = User,
-                       user_prop = [],
-                       exchange = ExchangeName,
-                       queue_name = QueueName,
-                       prefetch = Prefetch,
-                       conn_name = ConnName,
-                       trace_state = TraceState,
-                       consumer_tag = consumer_tag(ConnectedAt),
-                       connected_at = ConnectedAt},
-            InitialState = #state{cfg = Cfg,
-                                  queue_states = rabbit_queue_type:init(),
-                                  auth_state = AuthState},
+        ok ?= rabbit_web_ocpp_util:ensure_exchange(ExchangeName, User#user.username),
+        {ok, StateAfterQueue} ?= ensure_queue_and_binding(InitialState),
+        {ok, FinalState} ?= consume_from_queue(StateAfterQueue),
 
-            {ok, StateAfterQueue} ?= ensure_queue_and_binding(InitialState),
-            {ok, FinalState} ?= consume_from_queue(StateAfterQueue),
+        %% Register the connection and let the handler emit connection_created
+        %% only now that the connection is fully established (consume_from_queue succeeded).
+        ok = rabbit_networking:register_non_amqp_connection(self()),
+        rabbit_global_counters:consumer_created(ProtoVer),
+        self() ! connection_created,
 
-            %% Register the connection and let the handler emit connection_created
-            %% only now that the connection is fully established (consume_from_queue succeeded).
-            ok = rabbit_networking:register_non_amqp_connection(self()),
-            rabbit_global_counters:consumer_created(ProtoVer),
-            self() ! connection_created,
+        ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
+                  [ConnName0, ClientId, Vhost]),
+        {ok, FinalState}
+    else
+        {error, Reason} ->
+            ?LOG_ERROR("OCPP connection failed for ClientId ~ts: ~p", [ClientId, Reason]),
+            {error, Reason}
+    end.
 
-            ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
-                      [ConnName0, ClientId, Vhost]),
-            {ok, FinalState}
-        else
-            {error, Reason} ->
-                ?LOG_ERROR("OCPP connection failed for ClientId ~ts: ~p", [ClientId, Reason]),
-                {error, Reason} % Return the error reason
-        end,
-    Result.
+-spec connected_at(state()) -> pos_integer().
+connected_at(#state{cfg = #cfg{connected_at = ConnectedAt}}) ->
+    ConnectedAt.
 
-%% Process incoming OCPP message (parsed list + raw binary)
--spec process_incoming(McOcpp :: #ocpp_msg{}, state()) -> {ok, state()} | {error, term(), state()}.
-process_incoming(McOcpp = #ocpp_msg{},
-                State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
-                                                    client_id = ClientId,
-                                                    trace_state = TraceState,
-                                                    conn_name = ConnName},
-                                         auth_state = #auth_state{user = #user{username = Username}}}) ->
+%% Another connection of the same charge point took over: the charge point
+%% is online, so this connection must not announce it offline.
+-spec duplicate_id_kicked(state()) -> state().
+duplicate_id_kicked(State) ->
+    State#state{publish_offline = false}.
 
-    %% 1. Generate structured routing key (protocolver.actionname.req/conf)
+%% @doc Handles an incoming WebSocket text frame: decodes and validates the
+%% OCPP message, then publishes it.
+-spec handle_text_frame(binary(), state()) ->
+    {ok, state(), cowboy_websocket:commands()} |
+    {error, invalid_json | invalid_message | access_refused | term(), state()}.
+handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId}}) ->
+    try json:decode(Data) of
+        Decoded ->
+            case validate(Decoded) of
+                {ok, Msg} ->
+                    State1 = maybe_update_props_from_message(Msg, State),
+                    handle_ocpp_message(Msg, Data, State1);
+                {error, Reason} ->
+                    ?LOG_WARNING("Web OCPP client ~ts sent an invalid OCPP message (~ts): ~ts",
+                                 [ClientId, Reason, truncate(Data)]),
+                    {error, invalid_message, State}
+            end
+    catch
+        error:Reason ->
+            ?LOG_WARNING("Web OCPP client ~ts sent invalid JSON (~0P): ~ts",
+                         [ClientId, Reason, 5, truncate(Data)]),
+            {error, invalid_json, State}
+    end.
+
+%% Validated message: {MessageType, MessageId, Action | undefined}
+validate([Type, MsgId, Action, Payload])
+  when Type =:= ?OCPP_MESSAGE_TYPE_CALL;
+       Type =:= ?OCPP_MESSAGE_TYPE_SEND ->
+    maybe
+        ok ?= validate_msg_id(MsgId, ?MAX_MSG_ID_BYTES),
+        ok ?= case is_binary(Action) andalso Action =/= <<>> of
+                  true -> ok;
+                  false -> {error, <<"action is not a non-empty string">>}
+              end,
+        ok ?= case is_map(Payload) of
+                  true -> ok;
+                  false -> {error, <<"payload is not an object">>}
+              end,
+        {ok, {Type, MsgId, Action, Payload}}
+    end;
+validate([?OCPP_MESSAGE_TYPE_CALLRESULT = Type, MsgId, Payload]) ->
+    maybe
+        ok ?= validate_msg_id(MsgId, ?MAX_RESPONSE_MSG_ID_BYTES),
+        {ok, {Type, MsgId, undefined, Payload}}
+    end;
+validate([Type, MsgId, ErrorCode, _ErrorDescription, _ErrorDetails])
+  when Type =:= ?OCPP_MESSAGE_TYPE_CALLERROR;
+       Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULTERROR ->
+    maybe
+        ok ?= validate_msg_id(MsgId, ?MAX_RESPONSE_MSG_ID_BYTES),
+        ok ?= case is_binary(ErrorCode) of
+                  true -> ok;
+                  false -> {error, <<"error code is not a string">>}
+              end,
+        {ok, {Type, MsgId, undefined, undefined}}
+    end;
+validate(_) ->
+    {error, <<"unknown message structure">>}.
+
+validate_msg_id(MsgId, MaxBytes)
+  when is_binary(MsgId), byte_size(MsgId) > 0, byte_size(MsgId) =< MaxBytes ->
+    ok;
+validate_msg_id(_, _) ->
+    {error, <<"invalid message ID">>}.
+
+handle_ocpp_message({Type, MsgId, Action0, _Payload}, Data,
+                    State0 = #state{cfg = #cfg{client_id = ClientId}}) ->
+    %% Answers to a CALL of the CSMS carry the action of that CALL, so that
+    %% workers can bind to e.g. ocpp16.GetConfiguration.conf.
+    {Action, State1} = case is_response(Type) of
+                           true -> complete_call(MsgId, State0);
+                           false -> {Action0, State0}
+                       end,
+    McOcpp = #ocpp_msg{msg_type = Type,
+                       msg_id = MsgId,
+                       action = Action,
+                       payload = Data,
+                       client_id = ClientId},
+    case publish(McOcpp, State1) of
+        {ok, unroutable, State2} when Type =:= ?OCPP_MESSAGE_TYPE_CALL ->
+            %% Nobody would answer. Do not let the charge point wait for a
+            %% timeout (and maybe retry or reboot) [OCPP-J 4.2.3].
+            Frame = [?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, <<"NotImplemented">>,
+                     <<"No handler for action ", Action/binary>>, #{}],
+            drain_frames(buffer_frame({text, iolist_to_binary(json:encode(Frame))}, State2));
+        {ok, _, State2} ->
+            drain_frames(State2);
+        {error, _, _} = Err ->
+            Err
+    end.
+
+is_response(Type) ->
+    Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULT orelse
+    Type =:= ?OCPP_MESSAGE_TYPE_CALLERROR orelse
+    Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULTERROR.
+
+%% Publishes a message of the charge point to the exchange.
+-spec publish(#ocpp_msg{}, state()) ->
+    {ok, {routed, [rabbit_amqqueue:name()]} | unroutable, state()} | {error, term(), state()}.
+publish(McOcpp, State) ->
+    publish(McOcpp, #{}, State).
+
+publish(McOcpp = #ocpp_msg{}, Options,
+        State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
+                                  client_id = ClientId,
+                                  trace_state = TraceState,
+                                  conn_name = ConnName},
+                       auth_state = #auth_state{user = #user{username = Username}}}) ->
     RoutingKey = generate_routing_key(McOcpp, State),
-
-    %% 2. Check Publish Permissions (on Exchange and Topic/Routing Key)
     case check_publish_permitted(ExchangeName, RoutingKey, State) of
         ok ->
-            %% 3. Validate Exchange
             case rabbit_exchange:lookup(ExchangeName) of
                 {ok, Exchange} ->
-                    
-                    %% 4. Prepare annotations and initialize Message Container (mc) with mc_ocpp type
                     Anns = #{?ANN_EXCHANGE => ExchangeNameBin,
                              ?ANN_ROUTING_KEYS => [RoutingKey]},
                     McMsg = mc:init(mc_ocpp, McOcpp, Anns, #{}),
-                    ?LOG_DEBUG("Created message container for ClientId ~ts with routing key ~ts: ~tp", 
-                                [ClientId, RoutingKey, McMsg]),
-                    
-                    %% 5. Publish to the exchange with the structured routing key
                     case rabbit_exchange:route(Exchange, McMsg, #{}) of
                         [] ->
                             ?LOG_WARNING("OCPP message from ClientId ~ts routed to 0 queues. "
-                                        "Exchange: ~ts, routing key: ~ts",
-                                        [ClientId, rabbit_misc:rs(ExchangeName), RoutingKey]),
-                            {ok, State};
+                                         "Exchange: ~ts, routing key: ~ts",
+                                         [ClientId, rabbit_misc:rs(ExchangeName), RoutingKey]),
+                            {ok, unroutable, State};
                         QNames when is_list(QNames) ->
-                            %% 6. Trace (optional)
                             rabbit_trace:tap_in(McMsg, QNames, ConnName, Username, TraceState),
-                            ?LOG_DEBUG("OCPP message routed to ~p queues for ClientId ~ts: ~p",
-                                        [length(QNames), ClientId, QNames]),
-                            deliver_to_queues(McMsg, #{}, QNames, State),
-                            {ok, State};
+                            case deliver_to_queues(McMsg, QNames, Options, State) of
+                                {ok, Targets, State1} -> {ok, {routed, Targets}, State1};
+                                {error, _, _} = Err -> Err
+                            end;
                         {error, Reason} ->
                             ?LOG_ERROR("OCPP failed to route message via exchange ~ts: ~p",
-                                        [rabbit_misc:rs(ExchangeName), Reason]),
+                                       [rabbit_misc:rs(ExchangeName), Reason]),
                             {error, publish_failed, State}
                     end;
                 {error, not_found} ->
-                    ?LOG_ERROR("Exchange ~ts does not exist for ClientId ~ts", [rabbit_misc:rs(ExchangeName), ClientId]),
+                    ?LOG_ERROR("Exchange ~ts does not exist for ClientId ~ts",
+                               [rabbit_misc:rs(ExchangeName), ClientId]),
                     {error, exchange_not_found, State}
             end;
         {error, access_refused} ->
-            ?LOG_WARNING("OCPP publish refused for ClientId ~ts to exchange ~ts", [ClientId, rabbit_misc:rs(ExchangeName)]),
+            ?LOG_WARNING("OCPP publish refused for ClientId ~ts to exchange ~ts",
+                         [ClientId, rabbit_misc:rs(ExchangeName)]),
             {error, access_refused, State}
     end.
 
-deliver_to_queues(Message,
-                  Options,
-                  RoutedToQNames,
+%% The queue type state must be kept: quorum queues track publishers by
+%% sequence number, so a fresh state for every publish makes them drop all
+%% but the first message of a connection as duplicates.
+deliver_to_queues(Message, RoutedToQNames, Options,
                   State0 = #state{queue_states = QStates0,
                                   cfg = #cfg{proto_ver = ProtoVer}}) ->
-    FilteredQNames = drop_local(RoutedToQNames, State0),
-    Qs0 = lookup_queue_targets(FilteredQNames),
+    Qs0 = lookup_queue_targets(drop_local(RoutedToQNames, State0)),
     Qs = rabbit_amqqueue:prepend_extra_bcc(Qs0),
-    ?LOG_DEBUG("Delivering to queue ~p with state ~p", [Qs, QStates0]),
     case rabbit_queue_type:deliver(Qs, Message, Options, QStates0) of
-        {ok, _QStates, Actions} ->
+        {ok, QStates, Actions} ->
             rabbit_global_counters:messages_routed(ProtoVer, length(Qs)),
-            % State = process_routing_confirm(Options, Qs,
-            %                                 State0#state{queue_states = QStates}),
-            %% Actions must be processed after registering confirms as actions may
-            %% contain rejections of publishes.
-            {ok, handle_queue_actions(Actions, State0)};
+            Targets = [amqqueue:get_name(target_queue(Q)) || Q <- Qs],
+            try handle_queue_actions(Actions, State0#state{queue_states = QStates}) of
+                State -> {ok, Targets, State}
+            catch throw:consuming_queue_down ->
+                    {error, consuming_queue_down, State0}
+            end;
         {error, Reason} ->
-            Corr = maps:get(correlation, Options, undefined),
-            ?LOG_ERROR("Failed to deliver message with packet_id=~p to queues: ~p",
-                       [Corr, Reason]),
-            {error, Reason, State0}
+            ?LOG_ERROR("OCPP failed to deliver message to queues ~p: ~p",
+                       [[amqqueue:get_name(Q) || Q <- Qs0], Reason]),
+            {error, publish_failed, State0}
     end.
+
+target_queue({Q, _RouteInfos}) -> Q;
+target_queue(Q) -> Q.
 
 %% OCPP Messages MUST NOT be forwarded to a connection with a ClientID
 %% equal to the ClientID of the publishing connection.
 drop_local(QNames, #state{cfg = #cfg{queue_name = OwnQueueName}}) ->
-    lists:filter(fun(QName) -> QName =/= OwnQueueName end, QNames);
-drop_local(QNames, _) ->
-    QNames.
+    lists:filter(fun(QName) -> QName =/= OwnQueueName end, QNames).
 
 lookup_queue_targets(QNames) ->
     case erlang:function_exported(rabbit_db_queue, get_targets, 1) of
@@ -272,28 +397,34 @@ register_client_id(Vhost, ClientId)
     %%
     %% The monitor is installed *before* joining, so the event stream is
     %% complete: a member never sees joins that happened before its own
-    %% monitor, therefore only an *older* connection can observe the join
-    %% of a newer one, upon which it closes itself (see the corresponding
-    %% websocket_info clauses in rabbit_web_ocpp_handler). This also
-    %% converges after a network partition heals, when pg re-syncs
-    %% memberships, something an erpc broadcast at connect time misses.
+    %% monitor. Members that observe each other's join (e.g. after a network
+    %% partition healed and pg re-synced memberships) exchange their connection
+    %% times and only the older one closes (see the corresponding
+    %% websocket_info clauses in rabbit_web_ocpp_handler).
     {_Ref, Members} = pg:monitor(?PG_SCOPE, PgGroup),
     ok = pg:join(?PG_SCOPE, PgGroup, self()),
-    %% Disconnect the already-known members and wait for them to die.
-    %% A 'DOWN' fires only after the old connection fully terminated, i.e.
-    %% after it published its final offline status and its exit released
-    %% the exclusive consumer, so this connection is ready to bind, consume
-    %% and announce itself the moment the monitor fires.
+    %% Disconnect the already-known members and wait for them to die, so that
+    %% the exclusive consumer is released by the time this connection consumes.
+    %% Kicked connections do not announce the charge point offline, so nothing
+    %% they publish can overtake the online status of this connection. A
+    %% connection that does not terminate in time (e.g. because it is stuck
+    %% writing to a dead socket) is killed: otherwise it would keep the
+    %% consumer and this connection would fail.
     lists:foreach(fun(Pid) ->
                           MRef = erlang:monitor(process, Pid),
                           gen_server:cast(Pid, {duplicate_id}),
                           receive
                               {'DOWN', MRef, process, Pid, _} -> ok
                           after ?DUPLICATE_ID_KICK_TIMEOUT_MS ->
-                              erlang:demonitor(MRef, [flush]),
                               ?LOG_WARNING("Web OCPP connection ~p with duplicate "
-                                           "client ID did not terminate in ~bms",
-                                           [Pid, ?DUPLICATE_ID_KICK_TIMEOUT_MS])
+                                           "client ID did not terminate in ~bms, killing it",
+                                           [Pid, ?DUPLICATE_ID_KICK_TIMEOUT_MS]),
+                              exit(Pid, kill),
+                              receive
+                                  {'DOWN', MRef, process, Pid, _} -> ok
+                              after ?DUPLICATE_ID_KICK_TIMEOUT_MS ->
+                                  erlang:demonitor(MRef, [flush])
+                              end
                           end
                   end, Members -- [self()]).
 
@@ -305,44 +436,67 @@ consumer_tag(ConnectedAt) ->
       ".", (integer_to_binary(Unique))/binary>>.
 
 %% Handle internal messages, queue events, etc.
--spec handle_info(term(), state()) -> {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
-handle_info({queue_event, QName, Evt}, State = #state{queue_states = QStates0}) ->
-    case rabbit_queue_type:handle_event(QName, Evt, QStates0) of
-        {ok, QStates, Actions} ->
-            State1 = State#state{queue_states = QStates},
-            drain_frames(handle_queue_actions(Actions, State1));
-        {protocol_error, _, _, _} = Error ->
-            {stop, {shutdown, Error}, State};
-        {eol, Actions} -> % Queue deleted or gone
-             State1 = handle_queue_actions(Actions, State),
-             QStates = rabbit_queue_type:remove(QName, QStates0),
-             drain_frames(State1#state{queue_states = QStates});
-        Other ->
-             ?LOG_WARNING("Unhandled queue event for ~ts: ~p", [rabbit_misc:rs(QName), Other]),
-             drain_frames(State)
+-spec handle_info(term(), state()) ->
+    {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
+handle_info({queue_event, QName, Evt}, State0 = #state{queue_states = QStates0}) ->
+    try
+        case rabbit_queue_type:handle_event(QName, Evt, QStates0) of
+            {ok, QStates, Actions} ->
+                State1 = State0#state{queue_states = QStates},
+                drain_frames(handle_queue_actions(Actions, State1));
+            {eol, Actions} -> % Queue deleted
+                State1 = handle_queue_actions(Actions, State0),
+                QStates = rabbit_queue_type:remove(QName, QStates0),
+                drain_frames(handle_queue_down(QName, State1#state{queue_states = QStates}));
+            {protocol_error, _, _, _} = Error ->
+                {stop, {shutdown, Error}, State0}
+        end
+    catch throw:consuming_queue_down ->
+              {stop, consuming_queue_down, State0}
     end;
-
-handle_info({'DOWN', _, process, Pid, Reason}, State = #state{queue_states = QStates0}) ->
-    %% Handle queue process down event
-    case rabbit_queue_type:handle_down(Pid, undefined, Reason, QStates0) of
-         {ok, QStates1, Actions} ->
-            State1 = State#state{queue_states = QStates1},
-            drain_frames(handle_queue_actions(Actions, State1));
-         {eol, QStates1, _QRef} -> % Queue is gone
-             ?LOG_WARNING("OCPP queue process ~p down, queue is gone (EOL)", [Pid]),
-             drain_frames(State#state{queue_states = QStates1});
-         _ ->
-             ?LOG_WARNING("OCPP queue process ~p down, reason: ~p", [Pid, Reason]),
-             drain_frames(State)
-    end;
-
-handle_info(connection_closed, State) -> % Message from RabbitMQ core if underlying socket closes
-    ?LOG_INFO("OCPP underlying connection closed notification received."),
-    {stop, normal, State};
-
+handle_info({ocpp_call_timeout, MsgId},
+            State0 = #state{outstanding_call = #call{msg_id = MsgId, action = Action},
+                            cfg = #cfg{client_id = ClientId, call_timeout = Timeout}}) ->
+    ?LOG_WARNING("OCPP charge point ~ts did not answer ~ts CALL ~ts within ~bms",
+                 [ClientId, Action, truncate(MsgId), Timeout]),
+    {_, State} = complete_call(MsgId, State0),
+    drain_frames(State);
+handle_info({ocpp_call_timeout, _MsgId}, State) ->
+    %% Answered in the meantime.
+    drain_frames(State);
 handle_info(Msg, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_WARNING("OCPP processor for ~ts received unknown message: ~p", [ClientId, Msg]),
     drain_frames(State).
+
+%% A queue process this connection publishes to or consumes from went down.
+-spec handle_down(term(), state()) ->
+    {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
+handle_down({{'DOWN', QName}, _MRef, process, QPid, Reason},
+            State0 = #state{queue_states = QStates0}) ->
+    try
+        case rabbit_queue_type:handle_down(QPid, QName, Reason, QStates0) of
+            {ok, QStates, Actions} ->
+                drain_frames(handle_queue_actions(Actions, State0#state{queue_states = QStates}));
+            {eol, QStates1, QRef} ->
+                QStates = rabbit_queue_type:remove(QRef, QStates1),
+                drain_frames(handle_queue_down(QRef, State0#state{queue_states = QStates}));
+            {error, _} = Err ->
+                ?LOG_WARNING("OCPP failed to handle down queue ~ts: ~p",
+                             [rabbit_misc:rs(QName), Err]),
+                drain_frames(State0)
+        end
+    catch throw:consuming_queue_down ->
+              {stop, consuming_queue_down, State0}
+    end.
+
+%% Without its consumer the charge point would look online but never receive
+%% another command. Make it reconnect.
+handle_queue_down(QName, #state{cfg = #cfg{queue_name = QName, client_id = ClientId}}) ->
+    ?LOG_WARNING("Terminating Web OCPP connection of ~ts because its queue ~ts is down",
+                 [ClientId, rabbit_misc:rs(QName)]),
+    throw(consuming_queue_down);
+handle_queue_down(_QName, State) ->
+    State.
 
 %% Drain accumulated outbound frames and return them to the caller along with
 %% a state that no longer holds them.
@@ -352,15 +506,17 @@ drain_frames(State = #state{pending_frames = Frames}) ->
 %% Terminate the processor
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
 terminate(Reason, Infos, State = #state{queue_states = QStates,
+                                        publish_offline = PublishOffline,
                                         cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
-    %% Whatever the reason for the disconnect, tell the backends the charge
-    %% point went offline with one final synthetic StatusNotification. On a
-    %% duplicate client ID kick this runs before the new connection
-    %% proceeds (see register_client_id/2), so the subsequent online status
-    %% is never overtaken by this one.
-    publish_offline_status(State),
-    ok = rabbit_queue_type:close(QStates), % Stop consuming
+    %% Tell the backends the charge point went offline with one final
+    %% synthetic StatusNotification, unless the charge point reconnected.
+    case PublishOffline of
+        true -> publish_offline_status(State);
+        false -> ok
+    end,
+    %% Unanswered CALLs are requeued when the consumer goes away.
+    ok = rabbit_queue_type:close(QStates),
     rabbit_core_metrics:connection_closed(self()),
     rabbit_event:notify(connection_closed, Infos),
     ok = rabbit_networking:unregister_non_amqp_connection(self()),
@@ -401,8 +557,20 @@ publish_offline_status(State = #state{cfg = #cfg{client_id = ClientId,
                        action = <<"StatusNotification">>,
                        payload = Frame,
                        client_id = ClientId},
-    try process_incoming(McOcpp, State) of
-        {ok, _} ->
+    %% The connection may be closing because the broker shuts down. Wait for
+    %% the queues to confirm the message, so that it is not lost while the
+    %% message stores stop.
+    try publish(McOcpp, #{correlation => ?OFFLINE_STATUS_CORRELATION}, State) of
+        {ok, {routed, Targets}, State1} ->
+            Deadline = erlang:monotonic_time(millisecond) + ?OFFLINE_STATUS_CONFIRM_TIMEOUT_MS,
+            case await_confirms(Targets, Deadline, State1) of
+                ok ->
+                    ok;
+                timeout ->
+                    ?LOG_WARNING("OCPP offline StatusNotification for ClientId ~ts "
+                                 "was not confirmed in time", [ClientId])
+            end;
+        {ok, unroutable, _} ->
             ok;
         {error, Err, _} ->
             ?LOG_WARNING("OCPP offline StatusNotification for ClientId ~ts failed: ~p",
@@ -412,27 +580,48 @@ publish_offline_status(State = #state{cfg = #cfg{client_id = ClientId,
                      [ClientId, Class, Err])
     end.
 
+await_confirms([], _Deadline, _State) ->
+    ok;
+await_confirms(Pending, Deadline, State = #state{queue_states = QStates0}) ->
+    Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'$gen_cast', {queue_event, QName, Evt}} ->
+            case rabbit_queue_type:handle_event(QName, Evt, QStates0) of
+                {ok, QStates, Actions} ->
+                    Done = [Q || {Settlement, Q, Corrs} <- Actions,
+                                 Settlement =:= settled orelse Settlement =:= rejected,
+                                 lists:member(?OFFLINE_STATUS_CORRELATION, Corrs)],
+                    await_confirms(Pending -- Done, Deadline,
+                                   State#state{queue_states = QStates});
+                _ ->
+                    await_confirms(lists:delete(QName, Pending), Deadline, State)
+            end;
+        {{'DOWN', QName}, _MRef, process, _Pid, _Reason} ->
+            await_confirms(lists:delete(QName, Pending), Deadline, State)
+    after Timeout ->
+              timeout
+    end.
+
 %% --- Internal Functions ---
 
 %% @doc Generates a structured routing key in the format: protocolver.actionname.req/conf/error
 %% Examples: "ocpp16.BootNotification.req", "ocpp16.Heartbeat.conf", "ocpp201.StatusNotification.req"
 -spec generate_routing_key(#ocpp_msg{}, state()) -> binary().
-generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action}, 
+generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
                      #state{cfg = #cfg{proto_ver = ProtoVer}}) ->
-    %% Convert protocol version atom to binary string
     ProtoVerBin = atom_to_binary(ProtoVer, utf8),
 
-    %% Handle action name (may be undefined for responses). The Action is client input
-    %% with no restrictions in OCPP so we need to clean it up for routing key usage.
+    %% Responses to unknown (e.g. timed out) CALLs have no action. The Action
+    %% is client input with no restrictions in OCPP so we need to clean it up
+    %% for routing key usage.
     ActionBin = case Action of
-        undefined -> <<"response">>;  % For CALLRESULT/CALLERROR without action
+        undefined -> <<"response">>;
         ActionName when is_binary(ActionName) ->
             case re:replace(ActionName, "[^A-Za-z0-9]", "", [global, {return, binary}]) of
                 <<>> -> <<"unknown">>;
                 <<Trimmed:?MAX_ACTION_BYTES/binary, _/binary>> -> Trimmed;
                 Clean -> Clean
-            end;
-        _ -> <<"unknown">>
+            end
     end,
 
     %% Determine message direction (req/conf/error)
@@ -441,78 +630,116 @@ generate_routing_key(#ocpp_msg{msg_type = MsgType, action = Action},
         ?OCPP_MESSAGE_TYPE_SEND -> <<"req">>;      % Request in OCPP 2.1
         ?OCPP_MESSAGE_TYPE_CALLRESULT -> <<"conf">>; % Response/confirmation
         ?OCPP_MESSAGE_TYPE_CALLERROR -> <<"error">>; % Error response
-        ?OCPP_MESSAGE_TYPE_CALLRESULTERROR -> <<"error">>; % Error in OCPP 2.1
-        _ -> <<"unknown">>
+        ?OCPP_MESSAGE_TYPE_CALLRESULTERROR -> <<"error">> % Error in OCPP 2.1
     end,
 
-    %% Construct routing key: ocpp<protocolver>.<actionname>.req|conf|error
     <<ProtoVerBin/binary, ".", ActionBin/binary, ".", MsgTypeBin/binary>>.
-
-%% @doc Extracts relevant metadata from a parsed OCPP message list.
-% -spec extract_ocpp_metadata(list()) -> {ok, MsgId :: binary(), Action :: binary() | undefined} | {error, term()}.
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALL, MsgId, Action, _Payload]) when is_binary(MsgId), is_binary(Action) -> {ok, MsgId, Action};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLRESULT, MsgId, _Payload]) when is_binary(MsgId) -> {ok, MsgId, undefined};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLERROR, MsgId, _EC, _ED, _EDet]) when is_binary(MsgId) -> {ok, MsgId, undefined};
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_SEND, MsgId, Action, _Payload]) when is_binary(MsgId), is_binary(Action) -> {ok, MsgId, Action}; % OCPP 2.1
-% extract_ocpp_metadata([?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MsgId, _EC, _ED, _EDet]) when is_binary(MsgId) -> {ok, MsgId, undefined}; % OCPP 2.1
-% extract_ocpp_metadata(Other) -> {error, {invalid_ocpp_list_for_metadata, Other}}.
 
 %% Handle actions resulting from queue events (deliveries, etc.)
 handle_queue_actions([], State) -> State;
-handle_queue_actions([{deliver, _ConsumerTag, AckRequired, Msgs} | Rest], State) ->
-    ?LOG_DEBUG("OCPP handling 'deliver' action. AckRequired: ~p, Msgs: ~tp", [AckRequired, Msgs]),
-    State1 = deliver_to_client(Msgs, AckRequired, State),
+handle_queue_actions([{deliver, _ConsumerTag, _AckRequired, Msgs} | Rest], State) ->
+    State1 = lists:foldl(fun deliver_to_client/2, State, Msgs),
     handle_queue_actions(Rest, State1);
-handle_queue_actions([{settled, _QName, _MsgIds} | Rest], State) ->
-    ?LOG_DEBUG("OCPP handling 'settled' action for MsgIds: ~tp", [_MsgIds]),
-    handle_queue_actions(Rest, State);
+handle_queue_actions([{queue_down, QName} | Rest], State) ->
+    handle_queue_actions(Rest, handle_queue_down(QName, State));
 handle_queue_actions([{block, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
-    ?LOG_WARNING("OCPP queue ~ts blocked for ClientId ~ts", [QName, ClientId]),
+    ?LOG_DEBUG("OCPP queue ~ts blocked for ClientId ~ts", [rabbit_misc:rs(QName), ClientId]),
     handle_queue_actions(Rest, State);
 handle_queue_actions([{unblock, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
-     ?LOG_INFO("OCPP queue ~ts unblocked for ClientId ~ts", [QName, ClientId]),
+    ?LOG_DEBUG("OCPP queue ~ts unblocked for ClientId ~ts", [rabbit_misc:rs(QName), ClientId]),
     handle_queue_actions(Rest, State);
 handle_queue_actions([Action | Rest], State) ->
     ?LOG_DEBUG("OCPP unhandled queue action: ~p", [Action]),
     handle_queue_actions(Rest, State).
 
-%% Deliver messages from the queue to the OCPP client via WebSocket.
-%% Outbound frames are buffered into State#state.pending_frames and drained
-%% by handle_info/2, which returns them directly to cowboy. This avoids the
-%% prior `self() ! {reply, Data}` indirection.
-deliver_to_client([], _AckRequired, State) -> State;
-deliver_to_client([{QName, QPid, QMsgId, _Redelivered, Mc} | Rest], AckRequired,
-                  State = #state{cfg = #cfg{client_id = ClientId,
-                                            trace_state = TraceState, conn_name = ConnName,
-                                            consumer_tag = ConsumerTag},
-                                 queue_states = QStates0,
-                                 auth_state = #auth_state{user = User}}) ->
-    try
-        McOcpp = mc:convert(mc_ocpp, Mc, mc_env()),
-        case mc:protocol_state(McOcpp) of
-             #ocpp_msg{payload = BinaryPayload} when is_binary(BinaryPayload) ->
-                ?LOG_DEBUG("OCPP delivering message to ~ts for QMsgId ~p", [ClientId, QMsgId]),
-                rabbit_trace:tap_out({QName, QPid, QMsgId, _Redelivered, Mc}, ConnName, User#user.username, TraceState),
-                {ok, QStates1, Actions1} = rabbit_queue_type:settle(
-                    QName, complete, ConsumerTag, [QMsgId], QStates0),
-                State1 = buffer_frame({text, BinaryPayload}, State#state{queue_states = QStates1}),
-                State2 = handle_queue_actions(Actions1, State1),
-                ok = maybe_notify_sent(QName, QPid, State2),
-                deliver_to_client(Rest, AckRequired, State2);
-            Other ->
-                ?LOG_ERROR("OCPP delivery error: Expected #ocpp_msg{} record but got ~tp", [Other]),
-                {ok, QStates3, Actions3} = rabbit_queue_type:settle(
-                    QName, discard, ConsumerTag, [QMsgId], QStates0),
-                State4 = handle_queue_actions(Actions3, State#state{queue_states = QStates3}),
-                deliver_to_client(Rest, AckRequired, State4)
-        end
-    catch Class:Reason:Stacktrace ->
-        ?LOG_ERROR("OCPP error delivering message to ~ts: ~p:~p~n~p",
-                   [ClientId, Class, Reason, Stacktrace]),
-        {ok, QStates4, Actions4} = rabbit_queue_type:settle(
-            QName, discard, ConsumerTag, [QMsgId], QStates0),
-        State5 = handle_queue_actions(Actions4, State#state{queue_states = QStates4}),
-        deliver_to_client(Rest, AckRequired, State5)
+%% Deliver a message from the charge point queue to the charge point.
+%% Outbound frames are buffered into State#state.pending_frames and returned
+%% to cowboy by the caller.
+deliver_to_client({QName, QPid, QMsgId, _Redelivered, Mc} = Delivery,
+                  State0 = #state{cfg = #cfg{client_id = ClientId,
+                                             trace_state = TraceState,
+                                             conn_name = ConnName},
+                                  auth_state = #auth_state{user = User}}) ->
+    State = try
+                #ocpp_msg{payload = Payload0} = mc:protocol_state(mc:convert(mc_ocpp, Mc, #{})),
+                Payload = iolist_to_binary(Payload0),
+                rabbit_trace:tap_out(Delivery, ConnName, User#user.username, TraceState),
+                case classify_outbound(Payload) of
+                    {call, MsgId, Action} ->
+                        %% Sent once the outstanding CALL, if any, completed.
+                        Call = #call{msg_id = MsgId, action = Action, qname = QName,
+                                     qmsg_id = QMsgId, payload = Payload},
+                        maybe_send_next_call(
+                          State0#state{held_calls = queue:in(Call, State0#state.held_calls)});
+                    other ->
+                        settle(QName, complete, QMsgId, buffer_frame({text, Payload}, State0))
+                end
+            catch throw:consuming_queue_down = Thrown ->
+                      throw(Thrown);
+                  Class:Reason:Stacktrace ->
+                      ?LOG_ERROR("OCPP error delivering message to ~ts: ~p:~p~n~p",
+                                 [ClientId, Class, Reason, Stacktrace]),
+                      settle(QName, discard, QMsgId, State0)
+            end,
+    ok = maybe_notify_sent(QName, QPid, State),
+    State.
+
+%% Only CALLs need to be told apart: they wait for the answer of the charge
+%% point. Anything else (answers to the charge point's own CALLs) is sent
+%% right away.
+classify_outbound(Payload) ->
+    try json:decode(Payload) of
+        [Type, MsgId, Action | _]
+          when (Type =:= ?OCPP_MESSAGE_TYPE_CALL orelse Type =:= ?OCPP_MESSAGE_TYPE_SEND),
+               is_binary(MsgId), is_binary(Action) ->
+            case Type of
+                ?OCPP_MESSAGE_TYPE_CALL -> {call, MsgId, Action};
+                %% OCPP 2.1 SEND is not answered.
+                ?OCPP_MESSAGE_TYPE_SEND -> other
+            end;
+        _ ->
+            other
+    catch error:_ ->
+              other
+    end.
+
+maybe_send_next_call(State = #state{outstanding_call = undefined,
+                                    held_calls = Held0,
+                                    cfg = #cfg{call_timeout = Timeout}}) ->
+    case queue:out(Held0) of
+        {{value, Call = #call{msg_id = MsgId, payload = Payload}}, Held} ->
+            TRef = erlang:send_after(Timeout, self(), {ocpp_call_timeout, MsgId}),
+            buffer_frame({text, Payload},
+                         State#state{outstanding_call = Call#call{timer = TRef},
+                                     held_calls = Held});
+        {empty, _} ->
+            State
+    end;
+maybe_send_next_call(State) ->
+    State.
+
+%% The charge point answered (or did not answer in time) the outstanding CALL.
+%% Returns the action of the CALL for routing the answer.
+complete_call(MsgId, State0 = #state{outstanding_call = #call{msg_id = MsgId,
+                                                              action = Action,
+                                                              qname = QName,
+                                                              qmsg_id = QMsgId,
+                                                              timer = TRef}}) ->
+    _ = erlang:cancel_timer(TRef),
+    State = settle(QName, complete, QMsgId, State0#state{outstanding_call = undefined}),
+    {Action, maybe_send_next_call(State)};
+complete_call(_MsgId, State) ->
+    {undefined, State}.
+
+settle(QName, Op, QMsgId, State = #state{queue_states = QStates0,
+                                         cfg = #cfg{consumer_tag = ConsumerTag}}) ->
+    case rabbit_queue_type:settle(QName, Op, ConsumerTag, [QMsgId], QStates0) of
+        {ok, QStates, Actions} ->
+            handle_queue_actions(Actions, State#state{queue_states = QStates});
+        {protocol_error, _Type, Fmt, Args} ->
+            ?LOG_WARNING("OCPP failed to settle message of ~ts: " ++ Fmt,
+                         [rabbit_misc:rs(QName) | Args]),
+            State
     end.
 
 buffer_frame(Frame, State = #state{pending_frames = Frames}) ->
@@ -529,38 +756,36 @@ maybe_notify_sent(QName, QPid, #state{queue_states = QStates}) ->
 %% Ensure the queue exists and is bound
 -spec ensure_queue_and_binding(state()) -> {ok, state()} | {error, term()}.
 ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
-                                                         exchange = _ExchangeName,
-                                                         client_id = _ClientId,
-                                                         vhost = Vhost}, % Need Vhost
-                                        auth_state = #auth_state{user = User = #user{username = Username}, % Need Username
-                                                                 authz_ctx = AuthzCtx}}) -> % Need AuthzCtx
-    %% 1. Check configure permission first
+                                                   vhost = Vhost},
+                                        auth_state = #auth_state{user = User = #user{username = Username},
+                                                                 authz_ctx = AuthzCtx}}) ->
     case check_resource_access(User, QName, configure, AuthzCtx) of
         ok ->
-            QArgs = [], % Define QArgs
-            %% Check DLX permissions if DLX args are present (simplified check)
-            case case rabbit_misc:table_lookup(QArgs, <<"x-dead-letter-exchange">>) of
-                     undefined -> ok; % No DLX, proceed
-                     {longstr, XNameBin} ->
-                         XName = #resource{virtual_host = Vhost, kind = exchange, name = XNameBin},
-                         check_resource_access(User, XName, write, AuthzCtx)
-                 end of
-                ok -> % DLX check passed or not needed
-                    %% 2. Declare the queue, unless it is already there
-                    case ensure_queue(QName, QArgs, Vhost, Username) of
-                        ok ->
-                            bind_queue(State); % Proceed to binding
-                        {error, _} = Error ->
-                            Error
-                    end;
-                {error, access_refused} -> % DLX permission failed
-                    ?LOG_WARNING("OCPP DLX permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
-                    {error, {queue_declare_failed, access_refused}}
-            end; % End of DLX check case
+            case ensure_queue(QName, queue_args(), Vhost, Username) of
+                ok ->
+                    bind_queue(State);
+                {error, _} = Error ->
+                    Error
+            end;
         {error, access_refused} ->
             ?LOG_WARNING("OCPP configure permission refused for queue ~ts", [rabbit_misc:rs(QName)]),
             {error, {queue_declare_failed, access_refused}}
     end.
+
+%% Arguments of newly declared charge point queues. Existing queues keep
+%% theirs: change those with a policy.
+-spec queue_args() -> rabbit_framing:amqp_table().
+queue_args() ->
+    Type = case rabbit_web_ocpp_util:get_env(queue_type) of
+               quorum -> <<"quorum">>;
+               classic -> <<"classic">>
+           end,
+    [{<<"x-queue-type">>, longstr, Type}] ++
+    [{Arg, long, Val}
+     || {Arg, Key} <- [{<<"x-message-ttl">>, queue_message_ttl},
+                       {<<"x-expires">>, queue_expires}],
+        Val <- [rabbit_web_ocpp_util:get_env(Key)],
+        is_integer(Val)].
 
 %% Declaring a classic queue always starts a queue process, which then writes
 %% to the metadata store even when the queue turns out to already exist. Under
@@ -572,8 +797,6 @@ ensure_queue_and_binding(State = #state{cfg = #cfg{queue_name = QName,
 ensure_queue(QName, QArgs, Vhost, Username) ->
     case rabbit_amqqueue:lookup(QName) of
         {ok, _Q} ->
-            ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.",
-                       [rabbit_misc:rs(QName)]),
             ok;
         {error, not_found} ->
             declare_queue(QName, QArgs, Vhost, Username)
@@ -595,8 +818,6 @@ declare_queue(QName, QArgs, Vhost, Username) ->
             ok;
         {existing, _ExistingQ} ->
             %% Another connection won the race between the lookup and here.
-            ?LOG_DEBUG("OCPP queue ~ts already exists, proceeding to bind.",
-                       [rabbit_misc:rs(QName)]),
             ok;
         {error, queue_limit_exceeded, Reason, ReasonArgs} ->
             ?LOG_ERROR(Reason, ReasonArgs),
@@ -613,16 +834,15 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
                                       exchange = ExchangeName,
                                       client_id = ClientId},
                           auth_state = #auth_state{user = User}}) ->
-    BindingArgs = [],
+    %% The client ID was validated not to contain topic separators or
+    %% wildcards (see rabbit_web_ocpp_util:validate_client_id/1).
     RoutingKey = ClientId,
     Binding = #binding{source = ExchangeName, destination = QName,
-                       key = RoutingKey, args = BindingArgs},
+                       key = RoutingKey, args = []},
     case check_binding_permitted(QName, ExchangeName, RoutingKey, State) of
         ok ->
             case rabbit_binding:add(Binding, User#user.username) of
                 ok ->
-                    ?LOG_DEBUG("OCPP queue ~ts bound to ~ts with key ~ts",
-                              [rabbit_misc:rs(QName), rabbit_misc:rs(ExchangeName), RoutingKey]),
                     {ok, State};
                 {error, Reason} ->
                     ?LOG_ERROR("OCPP failed to bind queue ~ts to ~ts: ~p",
@@ -641,70 +861,49 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                                              prefetch = Prefetch, consumer_tag = ConsumerTag},
                                   queue_states = QStates0,
                                   auth_state = #auth_state{user = User, authz_ctx = AuthzCtx}}) ->
-    %% Check read permission on the queue
     case check_resource_access(User, QName, read, AuthzCtx) of
         ok ->
-            ?LOG_DEBUG("OCPP about to consume from queue ~ts with prefetch ~p for ClientId ~ts",
-                      [rabbit_misc:rs(QName), Prefetch, ClientId]),
-            Spec = #{no_ack => false, % We need manual acks
+            Spec = #{no_ack => false,
                      channel_pid => self(),
-                     limiter_pid => none, % Use basic prefetch
+                     limiter_pid => none,
                      limiter_active => false,
                      mode => {simple_prefetch, Prefetch},
                      consumer_tag => ConsumerTag,
-                     exclusive_consume => true, % Allow other consumers? (false for OCPP)
+                     exclusive_consume => true,
                      args => [],
                      ok_msg => undefined,
                      acting_user => User#user.username},
-
-            %% Use rabbit_amqqueue:with to handle potential queue lookup races/errors
             rabbit_amqqueue:with(
                 QName,
                 fun(Q) ->
-                    % First check if we're already consuming from this queue
-                    case self_consumes(Q) of
-                        true ->
-                            ?LOG_INFO("OCPP already consuming from ~ts for ClientId ~ts",
-                                     [rabbit_misc:rs(QName), ClientId]),
-                            {ok, State}; % Already consuming, just return current state
-                        false ->
-                            case rabbit_queue_type:consume(Q, Spec, QStates0) of
-                                {ok, QStates} ->
-                                    ?LOG_INFO("OCPP successfully started consuming from ~ts with prefetch ~p for ClientId ~ts",
-                                             [rabbit_misc:rs(QName), Prefetch, ClientId]),
-                                    {ok, State#state{queue_states = QStates}};
-                                {error, Type, Fmt, FmtArgs} ->
-                                    ?LOG_ERROR("OCPP failed to consume from ~ts for ClientId ~ts: ~ts",
-                                             [rabbit_misc:rs(QName), ClientId,
-                                              rabbit_misc:format(Fmt, FmtArgs)]),
-                                    {error, {consume_failed, Type}}
-                            end
+                    case rabbit_queue_type:consume(Q, Spec, QStates0) of
+                        {ok, QStates} ->
+                            {ok, State#state{queue_states = QStates}};
+                        {error, Type, Fmt, FmtArgs} ->
+                            ?LOG_ERROR("OCPP failed to consume from ~ts for ClientId ~ts: ~ts",
+                                       [rabbit_misc:rs(QName), ClientId,
+                                        rabbit_misc:format(Fmt, FmtArgs)]),
+                            {error, {consume_failed, Type}}
                     end
                 end,
-                fun(ErrorType) -> % Handle case where queue doesn't exist during consume
+                fun(ErrorType) ->
                     ?LOG_ERROR("OCPP cannot consume, queue ~ts lookup failed for ClientId ~ts: ~p",
-                             [rabbit_misc:rs(QName), ClientId, ErrorType]),
+                               [rabbit_misc:rs(QName), ClientId, ErrorType]),
                     {error, {consume_failed, ErrorType}}
                 end);
         {error, access_refused} ->
             ?LOG_WARNING("OCPP consume permission refused for queue ~ts for ClientId ~ts",
-                       [rabbit_misc:rs(QName), ClientId]),
+                         [rabbit_misc:rs(QName), ClientId]),
             {error, {consume_failed, access_refused}}
     end.
-
-%% Check if this process is already consuming from the queue
--spec self_consumes(amqqueue:amqqueue()) -> boolean().
-self_consumes(Queue) ->
-    lists:any(fun(Consumer) ->
-                  element(1, Consumer) =:= self()
-              end, rabbit_amqqueue:consumers(Queue)).
 
 %% Generate queue name (e.g., ocpp.chargepoint_id)
 -spec queue_name(Vhost :: rabbit_types:vhost(), ClientId :: binary()) -> rabbit_amqqueue:name().
 queue_name(Vhost, ClientId) ->
     QNameBin = << "ocpp.", ClientId/binary >>,
     rabbit_misc:r(Vhost, queue, QNameBin).
-%% --- Permission Checks (Simplified wrappers around MQTT versions) ---
+
+%% --- Permission Checks ---
 
 %% Check permissions for publishing to the OCPP exchange
 check_publish_permitted(Exchange, RoutingKey, State = #state{auth_state = AuthState}) ->
@@ -728,8 +927,23 @@ check_binding_permitted(QName, ExchangeName, RoutingKey,
         Err -> Err
     end.
 
-%% Generic resource permission check (borrowed from MQTT, no caching here)
+%% Permission checks are cached, but only for a while: otherwise permission
+%% changes would never apply to established connections.
+expire_permission_caches() ->
+    Now = erlang:monotonic_time(millisecond),
+    case get(permission_cache_expires_at) of
+        ExpiresAt when is_integer(ExpiresAt), Now < ExpiresAt ->
+            ok;
+        _ ->
+            erase(permission_cache),
+            erase(topic_permission_cache),
+            put(permission_cache_expires_at,
+                Now + rabbit_web_ocpp_util:get_env(permission_cache_ttl)),
+            ok
+    end.
+
 check_resource_access(User, Resource, Perm, Context) ->
+    expire_permission_caches(),
     V = {Resource, Context, Perm},
     Cache = case get(permission_cache) of
                 undefined -> [];
@@ -758,6 +972,7 @@ check_topic_access(
          cfg = #cfg{client_id = ClientId,
                     vhost = Vhost,
                     exchange = XName = #resource{name = XNameBin}}}) ->
+    expire_permission_caches(),
     Cache = case get(topic_permission_cache) of
                 undefined -> [];
                 Other     -> Other
@@ -802,45 +1017,17 @@ init_trace(Vhost, ConnName0) ->
 %% Format status for management UI (very basic)
 -spec format_status(state()) -> map().
 format_status(#state{cfg = Cfg, queue_states = QStates, auth_state = AuthState}) ->
-    #{cfg => Cfg, % Include relevant config
-      queue_states => rabbit_queue_type:format_status(QStates), % Delegate queue status
-      auth_state => AuthState}. % Include auth info
+    #{cfg => Cfg,
+      queue_states => rabbit_queue_type:format_status(QStates),
+      auth_state => AuthState}.
 
-%% @doc Handles an incoming WebSocket text frame, decodes JSON, and validates the OCPP message structure.
-%% Returns {ok, #ocpp_msg{}} | {error, Reason :: binary()}.
--spec handle_text_frame(binary(), state()) -> {ok, #ocpp_msg{}, state()} | {error, binary()}.
-handle_text_frame(Data, State = #state{cfg = #cfg{client_id = ClientId}}) ->
-    try json:decode(Data) of
-        Decoded when is_list(Decoded) ->
-            % Successfully decoded a JSON list, validate its structure
-            case process_decoded_message(Decoded) of
-                {ok, ValidatedList} ->
-                    UpdatedState = maybe_update_props_from_message(ValidatedList, State),
-                    % Create mc_ocpp message
-                    {ok, #ocpp_msg{
-                        client_id = ClientId,
-                        msg_type = lists:nth(1, ValidatedList),
-                        msg_id = rabbit_data_coercion:to_binary(lists:nth(2, ValidatedList)),
-                        action = case ValidatedList of
-                                    [_Type, _MsgId, Action | _] when is_binary(Action) -> Action;
-                                    _ -> undefined
-                                 end,
-                        payload = Data
-                    }, UpdatedState};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        _Other ->
-            % Decoded JSON is not a list, which is invalid for OCPP
-            ?LOG_ERROR("Web OCPP received unexpected JSON structure (not an array): ~ts", [Data]),
-            {error, <<"Invalid JSON">>}
-    catch
-        % Handle JSON decoding errors
-        error:Reason:Stacktrace ->
-            ?LOG_ERROR("Web OCPP failed to decode JSON. Reason: ~tp, Data: ~ts, Stacktrace: ~tp",
-                       [Reason, Data, Stacktrace]),
-            {error, <<"Invalid JSON">>}
-    end.
+%% Client input in log lines is truncated, so that a misbehaving charge point
+%% cannot flood the logs.
+-spec truncate(binary()) -> binary().
+truncate(<<Head:?MAX_LOGGED_BYTES/binary, _/binary>> = Bin) ->
+    <<Head/binary, "... (", (integer_to_binary(byte_size(Bin)))/binary, " bytes)">>;
+truncate(Bin) when is_binary(Bin) ->
+    Bin.
 
 %% Seamlessly update both ETS tables without causing 404 errors.
 %% connection_created_stats is owned by rabbit_mgmt_storage, which the
@@ -859,47 +1046,18 @@ force_stats_refresh(State) ->
 force_stats_refresh(Tid, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     try
         Pid = self(),
-        %% Get fresh client properties from our state
         FreshClientProps = info(client_properties, State),
-
-        % rabbit_core_metrics:connection_created(Pid, FreshClientProps),
-
-        % %% 1. Update connection_created table (source of truth)
-        % case ets:lookup(connection_created, Pid) of
-        %     [{Pid, OldInfos}] ->
-        %         UpdatedInfos = lists:keystore(client_properties, 1, OldInfos, 
-        %                                     {client_properties, FreshClientProps}),
-        %         ets:insert(connection_created, {Pid, UpdatedInfos}),
-        %         ?LOG_DEBUG("OCPP updated connection_created table for ~ts", [ClientId]);
-        %     [] ->
-        %         ?LOG_WARNING("OCPP connection ~ts not found in connection_created ETS", [ClientId])
-        % end,
-        
-        %% 2. Update connection_created_stats table (formatted version) in-place
         case ets:lookup(Tid, Pid) of
             [{Pid, ConnName, OldStatsInfos}] ->
                 %% Convert proplist to map format using the same function as management plugin
                 FormattedClientProps = rabbit_misc:amqp_table(FreshClientProps),
                 UpdatedStatsInfos = lists:keystore(client_properties, 1, OldStatsInfos,
                                                  {client_properties, FormattedClientProps}),
-                ets:insert(Tid, {Pid, ConnName, UpdatedStatsInfos}),
-                ?LOG_DEBUG("OCPP updated connection_created_stats table for ~ts", [ClientId]);
+                ets:insert(Tid, {Pid, ConnName, UpdatedStatsInfos});
             [] ->
-                %% Stats entry doesn't exist yet - that's fine, it will be created on next collection
-                ?LOG_DEBUG("OCPP connection_created_stats entry not found for ~ts (will be created on next collection)", [ClientId])
-        end,
-        
-        % %% 3. Clear management cache to ensure API returns fresh data
-        % try
-        %     ProcName = rabbit_mgmt_db_cache:process_name(connections),
-        %     case whereis(ProcName) of
-        %         undefined -> ok;
-        %         CachePid -> gen_server:call(CachePid, purge_cache, 5000)
-        %     end
-        % catch _:_ -> ok end,
-        
-        ?LOG_DEBUG("OCPP seamlessly updated connection stats for ~ts", [ClientId])
-        
+                %% Created on the next collection.
+                ok
+        end
     catch
         Class:Reason:Stacktrace ->
             ?LOG_WARNING("Failed to refresh connection stats for ~ts: ~p:~p~n~p",
@@ -907,61 +1065,50 @@ force_stats_refresh(Tid, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     end,
     ok.
 
-%% @doc Updates state properties based on specific OCPP message actions.
-%% Currently handles BootNotification to update user_prop with device info.
--spec maybe_update_props_from_message(list(), state()) -> state().
-maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"BootNotification">>, Payload],
-                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps, proto_ver = ?OCPP_PROTO_V16}}) 
-  when is_map(Payload) ->
-    try
-        NewPropsList = maps:to_list(Payload),
-        MergedProps = lists:foldl(
-          fun({K, V}, Acc) ->
-                  BinKey = rabbit_data_coercion:to_binary(K),
-                  BinVal = rabbit_data_coercion:to_binary(V),
-                  lists:keystore(BinKey, 1, Acc, {BinKey, longstr, BinVal})
-          end, OldProps, NewPropsList),
-        ?LOG_DEBUG("Updated user_prop from BootNotification: ~p", [MergedProps]),
-        %% IMPORTANT: Update state FIRST, then refresh stats with updated state
-        UpdatedState = State#state{cfg = Cfg#cfg{user_prop = MergedProps}},
-        force_stats_refresh(UpdatedState),
-        UpdatedState
-    catch
-        error:Reason ->
-            ?LOG_WARNING("Could not process BootNotification payload for user_prop update. Reason: ~p", [Reason]),
-            State
-    end;
-
-maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"Heartbeat">>, _Payload], State) ->
-    %% Could update last_heartbeat timestamp in user_prop
-    State;
-
-maybe_update_props_from_message([?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotification">>, Payload], 
-                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps, proto_ver = ?OCPP_PROTO_V16}})
-  when is_map(Payload) ->
-    %% Extract required fields from the Payload
+%% @doc Updates the client properties shown in the management UI from
+%% BootNotification and StatusNotification. Only known keys and a bounded
+%% number of connectors are stored: the properties are client input.
+-spec maybe_update_props_from_message(tuple(), state()) -> state().
+maybe_update_props_from_message({?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"BootNotification">>, Payload},
+                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps,
+                                                                proto_ver = ?OCPP_PROTO_V16}}) ->
+    MergedProps = lists:foldl(
+                    fun(Key, Acc) ->
+                            case maps:get(Key, Payload, undefined) of
+                                Val when is_binary(Val) ->
+                                    lists:keystore(Key, 1, Acc,
+                                                   {Key, longstr, truncate_value(Val)});
+                                _ ->
+                                    Acc
+                            end
+                    end, OldProps, ?BOOT_NOTIFICATION_PROPS),
+    UpdatedState = State#state{cfg = Cfg#cfg{user_prop = MergedProps}},
+    force_stats_refresh(UpdatedState),
+    UpdatedState;
+maybe_update_props_from_message({?OCPP_MESSAGE_TYPE_CALL, _MsgId, <<"StatusNotification">>, Payload},
+                                State = #state{cfg = Cfg = #cfg{user_prop = OldProps,
+                                                                proto_ver = ?OCPP_PROTO_V16}}) ->
     case {maps:get(<<"connectorId">>, Payload, undefined),
           maps:get(<<"status">>, Payload, undefined),
           maps:get(<<"errorCode">>, Payload, undefined)} of
-        {ConnectorId, Status, ErrorCode} when is_integer(ConnectorId), is_binary(Status), is_binary(ErrorCode) ->
-            %% Construct the key and value for user_prop
-            ConnectorIdBin = erlang:integer_to_binary(ConnectorId),
-            Key = <<"statusConnectorId", ConnectorIdBin/binary>>,
-            %% Store a nested object with status and errorCode
-            Value = [{<<"status">>, Status}, {<<"errorCode">>, ErrorCode}],
+        {ConnectorId, Status, ErrorCode}
+          when is_integer(ConnectorId), ConnectorId >= 0, ConnectorId =< ?MAX_CONNECTOR_ID,
+               is_binary(Status), is_binary(ErrorCode) ->
+            Key = <<"statusConnectorId", (integer_to_binary(ConnectorId))/binary>>,
+            Value = [{<<"status">>, truncate_value(Status)},
+                     {<<"errorCode">>, truncate_value(ErrorCode)}],
             UpdatedProps = lists:keystore(Key, 1, OldProps, {Key, longstr, Value}),
-            %% Update state and refresh stats
             UpdatedState = State#state{cfg = Cfg#cfg{user_prop = UpdatedProps}},
             force_stats_refresh(UpdatedState),
             UpdatedState;
         _ ->
-            %% If any field is missing or invalid, return the original state
             State
     end;
-
-%% Default case - no state update needed
-maybe_update_props_from_message(_DecodedList, State) ->
+maybe_update_props_from_message(_Msg, State) ->
     State.
+
+truncate_value(<<Val:?MAX_PROPERTY_VALUE_BYTES/binary, _/binary>>) -> Val;
+truncate_value(Val) -> Val.
 
 -spec info(rabbit_types:info_key(), state()) -> any().
 info(host, #state{cfg = #cfg{ip_addr = Val}}) -> Val;
@@ -976,67 +1123,22 @@ info(user, #state{auth_state = #auth_state{user = #user{username = Val}}}) -> Va
 info(user_property, #state{cfg = #cfg{user_prop = Val}}) -> Val;
 info(vhost, #state{cfg = #cfg{vhost = Val}}) -> Val;
 %% for rabbitmq_management/priv/www/js/tmpl/connection.ejs
+%% Keys stay binaries, like AMQP 0-9-1 client properties: atoms are never
+%% garbage collected.
 info(client_properties, #state{cfg = #cfg{client_id = ClientId,
                                           user_prop = Prop}}) ->
-    ?LOG_DEBUG("OCPP client_properties for ~ts: ~p", [ClientId, Prop]),
-    L = [{chargePointId, longstr, ClientId},
-         {connection_name, longstr, <<"Charging Point">>}],
-    PropWithAtomKeys = [{binary_to_atom(K, utf8), T, V} || {K, T, V} <- Prop],
-    Result = L ++ PropWithAtomKeys,
-    ?LOG_DEBUG("OCPP client_properties AFTER for ~ts: ~p", [ClientId, Result]),
-    Result;
+    [{<<"chargePointId">>, longstr, ClientId},
+     {<<"connection_name">>, longstr, <<"Charging Point">>}
+     | Prop];
 info(channel_max, _) -> 0;
 info(node, _) -> node();
-info(frame_max, _) -> 0; % Not applicable like MQTT
-info(recv_oct, _) -> erlang:process_info(self(), message_queue_len); % Approx incoming? Needs better metric
-info(send_oct, _) -> 0; % Hard to track accurately here
-info(Other, #state{cfg=#cfg{client_id=ClientId}}) ->
-    ?LOG_DEBUG("OCPP info request for ~ts: ~p", [ClientId, Other]),
+info(frame_max, _) -> 0;
+info(_Other, _State) ->
     undefined.
 
-%% Internal function to validate the structure of the already decoded list based on OCPP message type.
-%% Returns {ok, DecodedList :: list()} | {error, Reason :: binary()}.
--spec process_decoded_message(list()) -> {ok, list()} | {error, binary()}.
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALL, MessageId, Action, _Payload] = Decoded) ->
-    ?LOG_DEBUG("Validated CALL: Id=~tp, Action=~tp", [MessageId, Action]), % Log less verbosely here
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULT, MessageId, _Payload] = Decoded) ->
-     ?LOG_DEBUG("Validated CALLRESULT: Id=~tp", [MessageId]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails] = Decoded) ->
-     ?LOG_DEBUG("Validated CALLERROR: Id=~tp, Code=~tp", [MessageId, ErrorCode]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_CALLRESULTERROR, MessageId, ErrorCode, _ErrorDescription, _ErrorDetails] = Decoded) -> % OCPP 2.1
-     ?LOG_DEBUG("Validated CALLRESULTERROR: Id=~tp, Code=~tp", [MessageId, ErrorCode]),
-    {ok, Decoded};
-process_decoded_message([?OCPP_MESSAGE_TYPE_SEND, MessageId, Action, _Payload] = Decoded) -> % OCPP 2.1
-     ?LOG_DEBUG("Validated SEND: Id=~tp, Action=~tp", [MessageId, Action]),
-    {ok, Decoded};
-process_decoded_message(Decoded) ->
-    % The list structure doesn't match any known OCPP message type/format
-    ?LOG_ERROR("Received invalid OCPP message structure: ~tp", [Decoded]),
-    {error, <<"Invalid OCPP message structure">>}.
-
 -spec proto_version_tuple(ocpp_protocol_version_atom() | undefined) -> tuple() | undefined.
-proto_version_tuple(?OCPP_PROTO_V12) -> {1, 2};
-proto_version_tuple(?OCPP_PROTO_V15) -> {1, 5};
 proto_version_tuple(?OCPP_PROTO_V16) -> {1, 6};
 proto_version_tuple(?OCPP_PROTO_V20) -> {2, 0};
 proto_version_tuple(?OCPP_PROTO_V201) -> {2, 0, 1};
 proto_version_tuple(?OCPP_PROTO_V21) -> {2, 1};
 proto_version_tuple(_) -> undefined.
-
-% %% Basic validation for decoded OCPP list structure
-% -spec is_valid_ocpp_list(list()) -> boolean().
-% is_valid_ocpp_list([Type, _MsgId, _Action, _Payload]) when Type =:= ?OCPP_MESSAGE_TYPE_CALL; Type =:= ?OCPP_MESSAGE_TYPE_SEND ->
-%     true;
-% is_valid_ocpp_list([Type, _MsgId, _Payload]) when Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULT ->
-%     true;
-% is_valid_ocpp_list([Type, _MsgId, _ErrorCode, _ErrorDesc, _ErrorDetails]) when Type =:= ?OCPP_MESSAGE_TYPE_CALLERROR; Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULTERROR ->
-%     true;
-% is_valid_ocpp_list(_) ->
-%     false.
-
-%% @doc Provides the environment for mc:convert/3. For OCPP->AMQP, no special env needed.
-mc_env() ->
-    #{}.

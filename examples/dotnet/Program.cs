@@ -13,14 +13,14 @@ namespace AmqpOcppClient
         static void Main(string[] args)
         {
             Console.WriteLine("Demo OCPP Central System (AMQP-backed, Stateless Worker)");
-            Console.WriteLine("Publishing responses to exchange: amq.topic with routing_key = <chargePointId>");
+            Console.WriteLine("Publishing responses to exchange: ocpp with routing_key = <chargePointId>");
             Console.WriteLine();
 
             var factory = new ConnectionFactory() { HostName = "localhost", Port = 5672, UserName = "guest", Password = "guest" };
             using (var connection = factory.CreateConnection())
             using (var channel = connection.CreateModel())
             {
-                string exchangeName = "amq.topic";
+                string exchangeName = "ocpp";
                 string queueName = "ocpp.worker";
 
                 channel.ExchangeDeclare(exchange: exchangeName, type: ExchangeType.Topic, durable: true);

@@ -8,6 +8,9 @@
 -define(APP_NAME, rabbitmq_web_ocpp).
 -define(PG_SCOPE, pg_scope_rabbitmq_web_ocpp_clientid).
 -define(DEFAULT_IDLE_TIMEOUT_MS, 60_000). %% 1 minute
+%% Largest accepted WebSocket frame. OCPP messages are small; this bounds the
+%% memory a single charge point can make the broker allocate.
+-define(DEFAULT_MAX_FRAME_SIZE, 1_048_576). %% 1 MiB
 
 %% Default zlib parameters applied when websocket compression is enabled.
 %% Bounds permessage-deflate memory to ~30 kB per connection (deflate:
@@ -33,27 +36,23 @@
 -define(CLOSE_UNACCEPTABLE_DATA_TYPE, 1003).
 -define(CLOSE_INVALID_PAYLOAD, 1007).
 -define(CLOSE_POLICY_VIOLATION, 1008). % e.g., unsupported subprotocol
+-define(CLOSE_INTERNAL_ERROR, 1011).
 
 %% WebSocket Subprotocol Name Registry
 %% https://www.iana.org/assignments/websocket/websocket.xml
--define(OCPP_PROTO_V12, ocpp12).
--define(OCPP_PROTO_V15, ocpp15).
 -define(OCPP_PROTO_V16, ocpp16).
 -define(OCPP_PROTO_V20, ocpp20).
 -define(OCPP_PROTO_V201, ocpp201).
 -define(OCPP_PROTO_V21, ocpp21).
 
 -type ocpp_protocol_version_atom() ::
-        ?OCPP_PROTO_V12
-        | ?OCPP_PROTO_V15
-        | ?OCPP_PROTO_V16
+        ?OCPP_PROTO_V16
         | ?OCPP_PROTO_V20
         | ?OCPP_PROTO_V201
         | ?OCPP_PROTO_V21.
 
+%% OCPP 1.2 and 1.5 only exist as SOAP, there is no OCPP-J flavour of them.
 -define(OCPP_PROTO_TO_ATOM(Proto), case Proto of
-    <<"ocpp1.2">> -> ?OCPP_PROTO_V12;
-    <<"ocpp1.5">> -> ?OCPP_PROTO_V15;
     <<"ocpp1.6">> -> ?OCPP_PROTO_V16;
     <<"ocpp2.0">> -> ?OCPP_PROTO_V20;
     <<"ocpp2.0.1">> -> ?OCPP_PROTO_V201;

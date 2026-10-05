@@ -114,7 +114,7 @@ class OcppMessageProxy extends RabbitMQJob
                     json_encode($response),
                     ['correlation_id' => $message->get('correlation_id') ?? '']
                 ),
-                'amq.topic',
+                'ocpp',
                 $message->get('reply_to')
             );
         }

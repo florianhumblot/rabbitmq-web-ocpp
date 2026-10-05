@@ -49,7 +49,7 @@ return [
                 'heartbeat' => 10,
                 'queue' => [
                     'queue' => env('RABBITMQ_QUEUE', 'ocpp.worker'),
-                    'exchange' => 'amq.topic',
+                    'exchange' => 'ocpp',
                     'exchange_type' => 'topic',
                     'exchange_routing_key' => 'ocpp16.#',
                     'job' => \App\Jobs\OcppMessageProxy::class,
