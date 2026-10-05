@@ -26,6 +26,7 @@ get_env(Key) ->
 
 default(exchange) -> <<"ocpp">>;
 default(prefetch_count) -> 10;
+default(max_held_calls) -> 100;
 default(call_timeout) -> 30_000;
 default(queue_type) -> classic;
 default(queue_message_ttl) -> 300_000;

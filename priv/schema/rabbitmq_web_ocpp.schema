@@ -221,12 +221,22 @@ end}.
 {mapping, "web_ocpp.exchange", "rabbitmq_web_ocpp.exchange",
     [{datatype, string}]}.
 
-%% Maximum number of unacknowledged messages delivered concurrently from a
-%% station's queue down its websocket.
+%% Credit for deliveries from a station's queue. CALLs held back behind
+%% the outstanding CALL do not use it up, so answers to the station's own
+%% requests are delivered past them.
 %%
-%% {prefetch_count, 1}
+%% {prefetch_count, 10}
 
 {mapping, "web_ocpp.prefetch_count", "rabbitmq_web_ocpp.prefetch_count",
+    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
+
+%% How many CALLs a connection holds back (unacknowledged, in memory) behind
+%% the outstanding CALL. Once reached, no further messages are delivered from
+%% the station's queue until the station answered or CALLs timed out.
+%%
+%% {max_held_calls, 100}
+
+{mapping, "web_ocpp.max_held_calls", "rabbitmq_web_ocpp.max_held_calls",
     [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
 
 %% How long (ms) a CALL sent to a charge point may stay unanswered. Only

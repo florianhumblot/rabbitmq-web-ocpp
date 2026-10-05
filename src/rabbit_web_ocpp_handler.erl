@@ -46,6 +46,7 @@
           %% Resource alarms this connection is blocked by.
           blocked_by = sets:new([{version, 2}]) :: sets:set(rabbit_alarm:resource_alarm_source()),
           ping_interval = infinity :: timeout(),
+          idle_timeout_ms = infinity :: timeout(),
           stats_timer :: option(rabbit_event:state()),
           vhost :: rabbit_types:vhost(),
           client_id :: client_id(),
@@ -144,6 +145,7 @@ init(Req, Opts) ->
                                    user = User, authz_ctx = AuthzCtx1,
                                    client_id = CId, idle_timeout = IdleSec,
                                    ping_interval = ping_interval(IdleMs),
+                                   idle_timeout_ms = maps:get(idle_timeout, WsOpts),
                                    ssl_login_name = SslLoginName,
                                    auth_mechanism = auth_mechanism(Username0, SslLoginName)},
                     {?MODULE, Req2, State, WsOpts};
@@ -426,12 +428,27 @@ conserve_resources(Pid, Source, {_, Conserve, _}) ->
 %% charge points cannot publish into a broker that is running out of memory
 %% or disk, and while the queues the charge point publishes to cannot keep up.
 %% TCP back pressure makes them wait.
+%% The idle timeout is suspended meanwhile: the pongs of the charge point
+%% are not read either.
 control_throttle(State = #state{connection_state = ConnState}) ->
     case {ConnState, is_throttled(State)} of
-        {running, true} -> {[{active, false}], State#state{connection_state = blocked}};
-        {blocked, false} -> {[{active, true}], State#state{connection_state = running}};
-        _ -> {[], State}
+        {running, true} ->
+            set_reading(false, [{active, false},
+                                {set_options, #{idle_timeout => infinity}}],
+                        State#state{connection_state = blocked});
+        {blocked, false} ->
+            set_reading(true, [{active, true},
+                               {set_options, #{idle_timeout => State#state.idle_timeout_ms}}],
+                        State#state{connection_state = running});
+        _ ->
+            {[], State}
     end.
+
+set_reading(_Reading, Cmds, State = #state{proc_state = undefined}) ->
+    {Cmds, State};
+set_reading(Reading, Cmds, State = #state{proc_state = PState0}) ->
+    {ok, PState, Frames} = rabbit_web_ocpp_processor:set_reading(Reading, PState0),
+    {Cmds ++ Frames, State#state{proc_state = PState}}.
 
 is_throttled(#state{blocked_by = BlockedBy, proc_state = PState}) ->
     not sets:is_empty(BlockedBy) orelse

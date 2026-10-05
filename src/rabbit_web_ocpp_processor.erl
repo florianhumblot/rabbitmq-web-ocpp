@@ -16,6 +16,7 @@
          handle_text_frame/2,
          duplicate_id_kicked/1,
          throttled/1,
+         set_reading/2,
          connected_at/1,
          format_status/1,
          proto_version_tuple/1,
@@ -77,7 +78,9 @@
         user :: #user{}, % Authenticated user details
         exchange :: rabbit_exchange:name(), % Exchange to publish *to* and bind *from*
         queue_name :: rabbit_amqqueue:name(), % The single queue for this client_id
-        prefetch :: non_neg_integer(),
+        %% Credit for deliveries from the charge point queue.
+        prefetch :: pos_integer(),
+        max_held_calls :: non_neg_integer(),
         call_timeout :: pos_integer(),
         conn_name :: option(binary()), % For logging/tracing
         user_prop :: user_property(),
@@ -99,7 +102,9 @@
         qname :: rabbit_amqqueue:name(),
         qmsg_id :: non_neg_integer(),
         payload :: binary(),
-        timer :: option(reference())
+        timer :: option(reference()),
+        %% Time left until the CALL times out while the timer is paused.
+        remaining :: option(non_neg_integer())
 }).
 
 -record(state, {
@@ -116,7 +121,15 @@
     %% Not when another connection of the same charge point took over.
     publish_offline = true :: boolean(),
     %% Quorum queues that asked publishers to slow down.
-    blocked_queues = [] :: [term()]
+    blocked_queues = [] :: [term()],
+    %% Credit based consumption from the charge point queue: unlike with a
+    %% prefetch limit, CALLs held back unacknowledged (see #call{}) do not use
+    %% up the credit, so that answers to the charge point's own requests
+    %% queued behind them are still delivered.
+    delivery_count = 0 :: rabbit_queue_type:delivery_count(),
+    credit = 0 :: integer(),
+    %% Whether the connection reads from the charge point (see set_reading/2).
+    reading = true :: boolean()
 }).
 
 -opaque state() :: #state{}.
@@ -167,7 +180,8 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
                    user_prop = [],
                    exchange = ExchangeName,
                    queue_name = QueueName,
-                   prefetch = rabbit_web_ocpp_util:get_env(prefetch_count),
+                   prefetch = max(1, rabbit_web_ocpp_util:get_env(prefetch_count)),
+                   max_held_calls = rabbit_web_ocpp_util:get_env(max_held_calls),
                    call_timeout = rabbit_web_ocpp_util:get_env(call_timeout),
                    conn_name = ConnName,
                    trace_state = TraceState,
@@ -185,7 +199,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
         %% only now that the connection is fully established (consume_from_queue succeeded).
         ok = rabbit_networking:register_non_amqp_connection(self()),
         ok = pg:join(?PG_SCOPE, ?CONNECTIONS_GROUP, self()),
-        rabbit_global_counters:consumer_created(ProtoVer),
+        ok = rabbit_web_ocpp_tracker:register_connection(ProtoVer),
         self() ! connection_created,
 
         ?LOG_INFO("OCPP connection ~ts established for ClientId ~ts on vhost ~ts",
@@ -211,8 +225,35 @@ duplicate_id_kicked(State) ->
 %% queues it publishes to cannot keep up (credit flow of classic queues,
 %% quorum queues over their soft limit).
 -spec throttled(state()) -> boolean().
+
 throttled(#state{blocked_queues = BlockedQueues}) ->
     BlockedQueues =/= [] orelse credit_flow:blocked().
+
+%% While the connection does not read from the charge point (resource alarm,
+%% credit flow), the charge point's answer to the outstanding CALL cannot
+%% arrive: its timeout is paused, and no further CALL is sent.
+-spec set_reading(boolean(), state()) -> {ok, state(), cowboy_websocket:commands()}.
+set_reading(false, State = #state{outstanding_call = Call = #call{timer = TRef}})
+  when TRef =/= undefined ->
+    Remaining = case erlang:cancel_timer(TRef) of
+                    false -> 0; %% Fired already: times out once reading resumes.
+                    Ms -> Ms
+                end,
+    drain_frames(State#state{reading = false,
+                             outstanding_call = Call#call{timer = undefined,
+                                                          remaining = Remaining}});
+set_reading(false, State) ->
+    drain_frames(State#state{reading = false});
+set_reading(true, State = #state{outstanding_call = Call = #call{timer = undefined,
+                                                                 msg_id = MsgId,
+                                                                 remaining = Remaining}})
+  when is_integer(Remaining) ->
+    TRef = erlang:send_after(Remaining, self(), {ocpp_call_timeout, MsgId}),
+    drain_frames(State#state{reading = true,
+                             outstanding_call = Call#call{timer = TRef,
+                                                          remaining = undefined}});
+set_reading(true, State) ->
+    drain_frames(maybe_send_next_call(State#state{reading = true})).
 
 %% @doc Handles an incoming WebSocket text frame: decodes and validates the
 %% OCPP message, then publishes it.
@@ -254,19 +295,33 @@ validate([Type, MsgId, Action, Payload])
               end,
         {ok, {Type, MsgId, Action, Payload}}
     end;
+%% An answer completes (acknowledges) the outstanding CALL: it must be well
+%% formed, or the CALL would be lost.
 validate([?OCPP_MESSAGE_TYPE_CALLRESULT = Type, MsgId, Payload]) ->
     maybe
         ok ?= validate_msg_id(MsgId, ?MAX_RESPONSE_MSG_ID_BYTES),
+        ok ?= case is_map(Payload) of
+                  true -> ok;
+                  false -> {error, <<"payload is not an object">>}
+              end,
         {ok, {Type, MsgId, undefined, Payload}}
     end;
-validate([Type, MsgId, ErrorCode, _ErrorDescription, _ErrorDetails])
+validate([Type, MsgId, ErrorCode, ErrorDescription, ErrorDetails])
   when Type =:= ?OCPP_MESSAGE_TYPE_CALLERROR;
        Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULTERROR ->
     maybe
         ok ?= validate_msg_id(MsgId, ?MAX_RESPONSE_MSG_ID_BYTES),
-        ok ?= case is_binary(ErrorCode) of
+        ok ?= case is_binary(ErrorCode) andalso ErrorCode =/= <<>> of
                   true -> ok;
-                  false -> {error, <<"error code is not a string">>}
+                  false -> {error, <<"error code is not a non-empty string">>}
+              end,
+        ok ?= case is_binary(ErrorDescription) of
+                  true -> ok;
+                  false -> {error, <<"error description is not a string">>}
+              end,
+        ok ?= case is_map(ErrorDetails) of
+                  true -> ok;
+                  false -> {error, <<"error details are not an object">>}
               end,
         {ok, {Type, MsgId, undefined, undefined}}
     end;
@@ -464,8 +519,10 @@ handle_info({queue_event, QName, Evt}, State0 = #state{queue_states = QStates0})
               {stop, consuming_queue_down, State0}
     end;
 handle_info({ocpp_call_timeout, MsgId},
-            State0 = #state{outstanding_call = #call{msg_id = MsgId, action = Action},
-                            cfg = #cfg{client_id = ClientId, call_timeout = Timeout}}) ->
+            State0 = #state{outstanding_call = #call{msg_id = MsgId, action = Action,
+                                                     timer = TRef},
+                            cfg = #cfg{client_id = ClientId, call_timeout = Timeout}})
+  when TRef =/= undefined ->
     ?LOG_WARNING("OCPP charge point ~ts did not answer ~ts CALL ~ts within ~bms",
                  [ClientId, Action, truncate(MsgId), Timeout]),
     {_, State} = complete_call(MsgId, State0),
@@ -510,16 +567,36 @@ handle_queue_down(_QName, State) ->
 
 %% Drain accumulated outbound frames and return them to the caller along with
 %% a state that no longer holds them.
-drain_frames(State = #state{pending_frames = Frames}) ->
+drain_frames(State0) ->
+    State = #state{pending_frames = Frames} = maybe_grant_credit(State0),
     {ok, State#state{pending_frames = []}, lists:reverse(Frames)}.
+
+%% Tops the credit up to the prefetch count once half of it is used, unless
+%% too many CALLs are held back already: those are kept in memory.
+maybe_grant_credit(State = #state{credit = Credit,
+                                  held_calls = Held,
+                                  delivery_count = DeliveryCount,
+                                  queue_states = QStates0,
+                                  cfg = #cfg{prefetch = Prefetch,
+                                             max_held_calls = MaxHeld,
+                                             queue_name = QName,
+                                             consumer_tag = ConsumerTag}}) ->
+    case Credit =< Prefetch div 2 andalso queue:len(Held) < MaxHeld of
+        true ->
+            {ok, QStates, Actions} = rabbit_queue_type:credit(
+                                       QName, ConsumerTag, DeliveryCount, Prefetch,
+                                       false, QStates0),
+            handle_queue_actions(Actions, State#state{queue_states = QStates,
+                                                      credit = Prefetch});
+        false ->
+            State
+    end.
 
 %% Terminate the processor
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
 terminate(Reason, Infos, State = #state{queue_states = QStates,
                                         publish_offline = PublishOffline,
-                                        cfg = #cfg{client_id = ClientId,
-                                                   proto_ver = ProtoVer}}) ->
-    rabbit_global_counters:consumer_deleted(ProtoVer),
+                                        cfg = #cfg{client_id = ClientId}}) ->
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
     %% Tell the backends the charge point went offline with one final
     %% synthetic StatusNotification, unless the charge point reconnected.
@@ -665,7 +742,11 @@ handle_queue_actions([Action | Rest], State) ->
 %% Deliver a message from the charge point queue to the charge point.
 %% Outbound frames are buffered into State#state.pending_frames and returned
 %% to cowboy by the caller.
-deliver_to_client({QName, QPid, QMsgId, Redelivered, Mc} = Delivery,
+deliver_to_client(Delivery, State00 = #state{delivery_count = DeliveryCount, credit = Credit}) ->
+    deliver_to_client1(Delivery, State00#state{delivery_count = serial_number:add(DeliveryCount, 1),
+                                               credit = Credit - 1}).
+
+deliver_to_client1({QName, _QPid, QMsgId, Redelivered, Mc} = Delivery,
                   State0 = #state{cfg = #cfg{client_id = ClientId,
                                              trace_state = TraceState,
                                              conn_name = ConnName},
@@ -692,7 +773,6 @@ deliver_to_client({QName, QPid, QMsgId, Redelivered, Mc} = Delivery,
                                  [ClientId, Class, Reason, Stacktrace]),
                       settle(QName, discard, QMsgId, State0)
             end,
-    ok = maybe_notify_sent(QName, QPid, State),
     State.
 
 %% Only CALLs need to be told apart: they wait for the answer of the charge
@@ -715,6 +795,7 @@ classify_outbound(Payload) ->
     end.
 
 maybe_send_next_call(State = #state{outstanding_call = undefined,
+                                    reading = true,
                                     held_calls = Held0,
                                     cfg = #cfg{call_timeout = Timeout}}) ->
     case queue:out(Held0) of
@@ -736,7 +817,10 @@ complete_call(MsgId, State0 = #state{outstanding_call = #call{msg_id = MsgId,
                                                               qname = QName,
                                                               qmsg_id = QMsgId,
                                                               timer = TRef}}) ->
-    _ = erlang:cancel_timer(TRef),
+    _ = case TRef of
+            undefined -> ok;
+            _ -> erlang:cancel_timer(TRef)
+        end,
     State = settle(QName, complete, QMsgId, State0#state{outstanding_call = undefined}),
     {Action, maybe_send_next_call(State)};
 complete_call(_MsgId, State) ->
@@ -779,14 +863,6 @@ settle(QName, Op, QMsgId, State = #state{queue_states = QStates0,
 
 buffer_frame(Frame, State = #state{pending_frames = Frames}) ->
     State#state{pending_frames = [Frame | Frames]}.
-
-maybe_notify_sent(QName, QPid, #state{queue_states = QStates}) ->
-    case rabbit_queue_type:module(QName, QStates) of
-        {ok, rabbit_classic_queue} ->
-            rabbit_amqqueue:notify_sent(QPid, self());
-        _ ->
-            ok
-    end.
 
 %% Ensure the queue exists and is bound
 -spec ensure_queue_and_binding(state()) -> {ok, state()} | {error, term()}.
@@ -878,6 +954,7 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
         ok ->
             case rabbit_binding:add(Binding, User#user.username) of
                 ok ->
+                    remove_other_bindings(Binding),
                     {ok, State};
                 {error, Reason} ->
                     ?LOG_ERROR("OCPP failed to bind queue ~ts to ~ts: ~p",
@@ -889,6 +966,21 @@ bind_queue(State = #state{cfg = #cfg{queue_name = QName,
                          [rabbit_misc:rs(QName), rabbit_misc:rs(ExchangeName)]),
             {error, {binding_failed, access_refused}}
     end.
+
+%% Charge point queues declared before the exchange changed (e.g. the
+%% default from amq.topic to ocpp) are still bound to the previous exchange,
+%% where other clients (e.g. MQTT, STOMP) could publish to the charge point.
+%% Remove such bindings the plugin made: those with the client ID as key.
+remove_other_bindings(#binding{source = XName, destination = QName, key = Key}) ->
+    lists:foreach(
+      fun(B = #binding{source = Src = #resource{name = SrcName}, key = K})
+            when K =:= Key, Src =/= XName, SrcName =/= <<>> ->
+              ?LOG_INFO("OCPP removing the binding of ~ts to ~ts with key ~ts",
+                        [rabbit_misc:rs(QName), rabbit_misc:rs(Src), Key]),
+              _ = rabbit_binding:remove(B, ?INTERNAL_USER);
+         (_) ->
+              ok
+      end, rabbit_binding:list_for_destination(QName)).
 
 %% Start consuming from the queue
 -spec consume_from_queue(state()) -> {ok, state()} | {error, term()}.
@@ -902,7 +994,7 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                      channel_pid => self(),
                      limiter_pid => none,
                      limiter_active => false,
-                     mode => {simple_prefetch, Prefetch},
+                     mode => {credited, 0},
                      consumer_tag => ConsumerTag,
                      exclusive_consume => true,
                      args => [],
@@ -912,8 +1004,13 @@ consume_from_queue(State = #state{cfg = #cfg{queue_name = QName, client_id = Cli
                 QName,
                 fun(Q) ->
                     case rabbit_queue_type:consume(Q, Spec, QStates0) of
-                        {ok, QStates} ->
-                            {ok, State#state{queue_states = QStates}};
+                        {ok, QStates1} ->
+                            {ok, QStates, Actions} = rabbit_queue_type:credit(
+                                                       QName, ConsumerTag, 0, Prefetch,
+                                                       false, QStates1),
+                            {ok, handle_queue_actions(
+                                   Actions, State#state{queue_states = QStates,
+                                                        credit = Prefetch})};
                         {error, Type, Fmt, FmtArgs} ->
                             ?LOG_ERROR("OCPP failed to consume from ~ts for ClientId ~ts: ~ts",
                                        [rabbit_misc:rs(QName), ClientId,

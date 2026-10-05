@@ -76,7 +76,13 @@ init([]) ->
           restart => transient,
           shutdown => ?WORKER_WAIT,
           type => worker,
-          modules => [pg]}
+          modules => [pg]},
+        #{id => rabbit_web_ocpp_tracker,
+          start => {rabbit_web_ocpp_tracker, start_link, []},
+          restart => transient,
+          shutdown => ?WORKER_WAIT,
+          type => worker,
+          modules => [rabbit_web_ocpp_tracker]}
     ],
 
     %% Return the supervision strategy and children

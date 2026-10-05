@@ -13,6 +13,7 @@ define PROJECT_ENV
 	    {allow_anonymous, false},
 	    {exchange, <<"ocpp">>},
 	    {prefetch_count, 10},
+	    {max_held_calls, 100},
 	    {call_timeout, 30000},
 	    {queue_type, classic},
 	    {queue_message_ttl, 300000},

@@ -38,10 +38,12 @@
  {exchange_and_prefetch,
   "web_ocpp.exchange = ocpp.csms
    web_ocpp.prefetch_count = 5
+   web_ocpp.max_held_calls = 50
    web_ocpp.call_timeout = 10000",
   [{rabbitmq_web_ocpp,
     [{exchange, "ocpp.csms"},
      {prefetch_count, 5},
+     {max_held_calls, 50},
      {call_timeout, 10000}]}],
   [rabbitmq_web_ocpp]},
  {station_queues,
