@@ -75,6 +75,10 @@ The communication flow is straightforward:
 7. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
 8. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
 
+Workers can use AMQP 0-9-1 or AMQP 1.0 (send commands to the address `/exchanges/ocpp/<EVSE ID>`), and messages of EVSEs can also be stored in streams, e.g. for auditing. The usual [connection limits](https://www.rabbitmq.com/docs/vhosts#limits) of vhosts and users apply to EVSE connections (refused with HTTP status 429), and an EVSE stops being read from while the queues it publishes to cannot keep up (credit flow) or a resource alarm is in effect.
+
+With `web_ocpp.proxy_protocol = true`, the client address announced by the load balancer is used for the `loopback_users` check, failed authentication attempts and connection details.
+
 EVSE IDs may only contain letters, digits and `-_~!$&'()+,;=:@`, at most 48 characters (`web_ocpp.max_client_id_length`): the EVSE ID is used as binding key on a topic exchange, so `.`, `*` and `#` are rejected.
 
 ### Configuration

@@ -82,7 +82,10 @@ init(Req, Opts) ->
     %% Retrieve the vhost and client_id from URL path first
     Vhost = cowboy_req:binding(vhost, Req),
     ClientId = cowboy_req:binding(client_id, Req),
-    {PeerIp, _PeerPort} = cowboy_req:peer(Req),
+    %% The client's address, also behind a load balancer using the PROXY
+    %% protocol (web_ocpp.proxy_protocol): it is checked against
+    %% loopback_users and recorded with failed authentication attempts.
+    {PeerIp, _PeerPort} = peer(Req),
     %% The transport socket is not accessible before the WebSocket takeover,
     %% so rejected connections cannot use rabbit_net:connection_string/2.
     %% Keep the peer address for rejection logging instead.
@@ -98,8 +101,6 @@ init(Req, Opts) ->
         _ ->
             {Username0, Password0} = basic_auth_creds(Req),
             SslLoginName = ssl_login_name_from_req(Req),
-            %% We don't use rabbit_net:maybe_get_proxy_socket(Sock) on purpose,
-            %% because we don't trust the PROXY protocol, maybe @TODO.
             IsSsl = cowboy_req:scheme(Req) =:= <<"https">>,
             Result = maybe
                 ok ?= check_client_id(ClientId, PeerIp),
@@ -114,6 +115,7 @@ init(Req, Opts) ->
                 AuthzCtx = #{<<"client_id">> => ClientId, <<"protocol">> => <<"ocpp">>,
                              <<"ssl">> => rabbit_data_coercion:to_binary(IsSsl)},
                 ok ?= check_vhost_access(Vhost, User0, ClientId, PeerIp, AuthzCtx),
+                ok ?= check_connection_limits(Vhost, User0),
                 {ok, Req1, Vhost, ClientId, User0, ProtoVer, AuthzCtx}
             end,
             %% Keep identifying info in the state so terminate/3 can log
@@ -149,6 +151,9 @@ init(Req, Opts) ->
                     {ok, cowboy_req:reply(400, #{<<"connection">> => <<"close">>}, Msg, Req), RejState};
                 {error, bad_vhost} ->
                     {ok, cowboy_req:reply(404, #{}, <<"Invalid Vhost">>, Req), RejState};
+                {error, connection_limit} ->
+                    {ok, cowboy_req:reply(429, #{<<"connection">> => <<"close">>},
+                                          <<"Connection limit reached">>, Req), RejState};
                 {error, vhost_down} ->
                     {ok, cowboy_req:reply(503, #{}, <<"Vhost is down">>, Req), RejState};
                 {error, invalid_subprotocol} ->
@@ -190,7 +195,7 @@ websocket_init(State0 = #state{socket = Socket, vhost = Vhost, client_id = Clien
             State2 = rabbit_event:init_stats_timer(State1, #state.stats_timer),
             % Inside `init` of the processor "connection_created" is called for management UI to show the connection
             case rabbit_web_ocpp_processor:init(Vhost, ClientId, ProtoVer,
-                                                rabbit_net:unwrap_socket(Socket),
+                                                Socket,
                                                 ConnName, User, AuthzCtx, fun send_reply/1) of
                 {ok, ProcState} ->
                     ?LOG_INFO("Accepted Web OCPP connection ~ts for client ID ~ts",
@@ -221,7 +226,8 @@ websocket_handle({text, Data}, State = #state{conn_name = ConnName, client_id = 
                                               proc_state = ProcState0}) ->
     case rabbit_web_ocpp_processor:handle_text_frame(Data, ProcState0) of
         {ok, ProcState, Frames} ->
-            {Frames, ensure_stats_timer(State#state{proc_state = ProcState}), hibernate};
+            {Cmds, State1} = control_throttle(State#state{proc_state = ProcState}),
+            {Frames ++ Cmds, ensure_stats_timer(State1), hibernate};
         {error, Reason, ProcState} ->
             ?LOG_WARNING("Web OCPP closing connection ~ts of client ID ~ts: ~p",
                          [ConnName, ClientId, Reason]),
@@ -263,6 +269,10 @@ websocket_info({conserve_resources, Source, Conserve},
                     false -> sets:del_element(Source, BlockedBy0)
                 end,
     {Cmds, State1} = control_throttle(State#state{blocked_by = BlockedBy}),
+    {Cmds, State1, hibernate};
+websocket_info({bump_credit, Msg}, State) ->
+    credit_flow:handle_bump_msg(Msg),
+    {Cmds, State1} = control_throttle(State),
     {Cmds, State1, hibernate};
 websocket_info(ping, State) ->
     %% Charge points answer pings with pongs, which resets the idle timeout:
@@ -394,7 +404,8 @@ terminate(Reason, _Request, Opts) ->
 %% Internal.
 
 handle_processor_result({ok, PState, Frames}, State) ->
-    {Frames, State#state{proc_state = PState}, hibernate};
+    {Cmds, State1} = control_throttle(State#state{proc_state = PState}),
+    {Frames ++ Cmds, State1, hibernate};
 handle_processor_result({stop, Reason, PState}, State = #state{conn_name = ConnName}) ->
     ?LOG_WARNING("Web OCPP closing connection ~ts: ~p", [ConnName, Reason]),
     stop(State#state{proc_state = PState}, ?CLOSE_INTERNAL_ERROR, <<"internal error">>).
@@ -413,17 +424,18 @@ conserve_resources(Pid, Source, {_, Conserve, _}) ->
 
 %% Stop reading from the socket while a resource alarm is in effect, so that
 %% charge points cannot publish into a broker that is running out of memory
-%% or disk. TCP back pressure makes them wait.
-control_throttle(State = #state{connection_state = running, blocked_by = BlockedBy}) ->
-    case sets:is_empty(BlockedBy) of
-        true -> {[], State};
-        false -> {[{active, false}], State#state{connection_state = blocked}}
-    end;
-control_throttle(State = #state{connection_state = blocked, blocked_by = BlockedBy}) ->
-    case sets:is_empty(BlockedBy) of
-        true -> {[{active, true}], State#state{connection_state = running}};
-        false -> {[], State}
+%% or disk, and while the queues the charge point publishes to cannot keep up.
+%% TCP back pressure makes them wait.
+control_throttle(State = #state{connection_state = ConnState}) ->
+    case {ConnState, is_throttled(State)} of
+        {running, true} -> {[{active, false}], State#state{connection_state = blocked}};
+        {blocked, false} -> {[{active, true}], State#state{connection_state = running}};
+        _ -> {[], State}
     end.
+
+is_throttled(#state{blocked_by = BlockedBy, proc_state = PState}) ->
+    not sets:is_empty(BlockedBy) orelse
+    (PState =/= undefined andalso rabbit_web_ocpp_processor:throttled(PState)).
 
 %% By default, ping at half the idle timeout.
 ping_interval(IdleMs) ->
@@ -491,14 +503,37 @@ auth_mechanism(_Username, none) ->
 %% same selection rule as rabbit_net:socket_ends/2 does for proxy sockets.
 -spec peer_addr(cowboy_req:req()) -> binary().
 peer_addr(Req) ->
-    {Ip, Port} = case maps:get(proxy_header, Req, undefined) of
-                     #{src_address := SrcIp, src_port := SrcPort} ->
-                         {SrcIp, SrcPort};
-                     _ ->
-                         cowboy_req:peer(Req)
-                 end,
+    {Ip, Port} = peer(Req),
     rabbit_data_coercion:to_binary(
       rabbit_misc:format("~s:~b", [rabbit_misc:ntoab(Ip), Port])).
+
+-spec peer(cowboy_req:req()) -> {inet:ip_address(), inet:port_number()}.
+peer(Req) ->
+    case maps:get(proxy_header, Req, undefined) of
+        #{src_address := SrcIp, src_port := SrcPort} ->
+            {SrcIp, SrcPort};
+        _ ->
+            cowboy_req:peer(Req)
+    end.
+
+%% Connection limits of the vhost and the user (rabbitmqctl set_vhost_limits,
+%% set_user_limits), like for any other protocol.
+check_connection_limits(Vhost, #user{username = Username}) ->
+    case rabbit_vhost_limit:is_over_connection_limit(Vhost) of
+        {true, Limit} ->
+            ?LOG_ERROR("OCPP connection refused: vhost '~ts' reached its connection limit (~b)",
+                       [Vhost, Limit]),
+            {error, connection_limit};
+        false ->
+            case rabbit_auth_backend_internal:is_over_connection_limit(Username) of
+                {true, Limit} ->
+                    ?LOG_ERROR("OCPP connection refused: user '~ts' reached its "
+                               "connection limit (~b)", [Username, Limit]),
+                    {error, connection_limit};
+                false ->
+                    ok
+            end
+    end.
 
 %% Extract SSL login name from the Cowboy request (available before WS upgrade).
 %% Used for mutual TLS / certificate-based authentication.

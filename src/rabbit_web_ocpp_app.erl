@@ -36,6 +36,7 @@
 start(_Type, _StartArgs) ->
     init_global_counters(),
     rabbit_web_ocpp_util:ensure_exchanges(),
+    ok = rabbit_web_ocpp_vhost_handler:add(),
     ok = rabbit_web_ocpp_drainer:start(),
     ocpp_init(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
@@ -48,6 +49,7 @@ prep_stop(State) ->
 stop(_State) ->
     %% Gone already when the broker shuts down.
     _ = catch rabbit_web_ocpp_drainer:stop(),
+    _ = catch rabbit_web_ocpp_vhost_handler:remove(),
     stop_listeners(?OCPP_TCP_PROTOCOL),
     stop_listeners(?OCPP_TLS_PROTOCOL),
     ok.
@@ -81,10 +83,16 @@ init([]) ->
     {ok, {{one_for_one, 1, 5}, Children}}.
 
 -spec list_connections() -> [pid()].
+%% Established OCPP connections of this node. The listeners' connections also
+%% include plain HTTP connections (e.g. idle keep-alive connections, or ones
+%% being authenticated), which cannot be asked for their details.
 list_connections() ->
-    PlainPids = rabbit_networking:list_local_connections_of_protocol(?OCPP_TCP_PROTOCOL),
-    TLSPids   = rabbit_networking:list_local_connections_of_protocol(?OCPP_TLS_PROTOCOL),
-    PlainPids ++ TLSPids.
+    try
+        pg:get_local_members(?PG_SCOPE, ?CONNECTIONS_GROUP)
+    catch error:badarg ->
+              %% The plugin is not running.
+              []
+    end.
 
 -spec emit_connection_info_all([node()], rabbit_types:info_keys(), reference(), pid()) -> term().
 emit_connection_info_all(Nodes, Items, Ref, AggregatorPid) ->

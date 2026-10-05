@@ -68,9 +68,9 @@ x_headers(#ocpp_msg{}) ->
 
 %%--------------------------------------------------------------------
 property(correlation_id, #ocpp_msg{msg_id = ID}) when is_binary(ID) ->
-    {binary, ID};
+    {utf8, ID};
 property(reply_to,       #ocpp_msg{client_id = C})  when is_binary(C) ->
-    {binary, C};
+    {utf8, C};
 property(_, _) ->
     undefined.
 
@@ -109,15 +109,17 @@ convert_from(_, _, _) ->
 -spec convert_to(atom(), #ocpp_msg{}, map()) -> term() | not_implemented.
 
 %% AMQP 1.0
+%% AMQP 1.0 values are tagged with their type: untagged ones cannot be
+%% encoded, e.g. for AMQP 1.0 consumers or streams.
 convert_to(mc_amqp, #ocpp_msg{payload=P, msg_id=ID, action=A, client_id=CID} = _Msg, Env) ->
     Header   = #'v1_0.header'{durable = true},
     Props    = #'v1_0.properties'{
-                  correlation_id = ID,
-                  subject        = A,
+                  correlation_id = utf8(ID),
+                  subject        = utf8(A),
                   content_type   = {symbol, ?CONTENT_TYPE_JSON},
-                  reply_to       = CID
+                  reply_to       = utf8(CID)
                },
-    Data     = #'v1_0.data'{content = P},
+    Data     = #'v1_0.data'{content = iolist_to_binary(P)},
     Sections = [Header, Props, Data],
     %% Use convert_from/3 here to turn a section list into
     %% a canonical AMQP message that the server knows how to frame.
@@ -160,6 +162,9 @@ convert_to(_, _, _) ->
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+utf8(undefined) -> undefined;
+utf8(Bin) when is_binary(Bin) -> {utf8, Bin}.
 
 %% @doc No‐op before sending—ensure payload is a binary
 -spec prepare(Atom :: atom(), Msg :: #ocpp_msg{}) -> #ocpp_msg{}.

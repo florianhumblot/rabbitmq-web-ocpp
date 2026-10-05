@@ -7,6 +7,8 @@
 
 -define(APP_NAME, rabbitmq_web_ocpp).
 -define(PG_SCOPE, pg_scope_rabbitmq_web_ocpp_clientid).
+%% Group of the established connections, in ?PG_SCOPE.
+-define(CONNECTIONS_GROUP, {?APP_NAME, connections}).
 -define(DEFAULT_IDLE_TIMEOUT_MS, 60_000). %% 1 minute
 %% Largest accepted WebSocket frame. OCPP messages are small; this bounds the
 %% memory a single charge point can make the broker allocate.

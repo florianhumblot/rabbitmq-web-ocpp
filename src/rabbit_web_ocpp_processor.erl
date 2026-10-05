@@ -15,6 +15,7 @@
          handle_down/2,
          handle_text_frame/2,
          duplicate_id_kicked/1,
+         throttled/1,
          connected_at/1,
          format_status/1,
          proto_version_tuple/1,
@@ -113,7 +114,9 @@
     held_calls = queue:new() :: queue:queue(#call{}),
     %% Whether to announce the charge point offline when the connection ends.
     %% Not when another connection of the same charge point took over.
-    publish_offline = true :: boolean()
+    publish_offline = true :: boolean(),
+    %% Quorum queues that asked publishers to slow down.
+    blocked_queues = [] :: [term()]
 }).
 
 -opaque state() :: #state{}.
@@ -181,6 +184,7 @@ process_connect(Vhost, ClientId, ProtoVer, Socket, ConnName0, User, AuthzCtx, Se
         %% Register the connection and let the handler emit connection_created
         %% only now that the connection is fully established (consume_from_queue succeeded).
         ok = rabbit_networking:register_non_amqp_connection(self()),
+        ok = pg:join(?PG_SCOPE, ?CONNECTIONS_GROUP, self()),
         rabbit_global_counters:consumer_created(ProtoVer),
         self() ! connection_created,
 
@@ -202,6 +206,13 @@ connected_at(#state{cfg = #cfg{connected_at = ConnectedAt}}) ->
 -spec duplicate_id_kicked(state()) -> state().
 duplicate_id_kicked(State) ->
     State#state{publish_offline = false}.
+
+%% Whether the connection must stop reading from the charge point because the
+%% queues it publishes to cannot keep up (credit flow of classic queues,
+%% quorum queues over their soft limit).
+-spec throttled(state()) -> boolean().
+throttled(#state{blocked_queues = BlockedQueues}) ->
+    BlockedQueues =/= [] orelse credit_flow:blocked().
 
 %% @doc Handles an incoming WebSocket text frame: decodes and validates the
 %% OCPP message, then publishes it.
@@ -269,7 +280,8 @@ validate_msg_id(_, _) ->
     {error, <<"invalid message ID">>}.
 
 handle_ocpp_message({Type, MsgId, Action0, _Payload}, Data,
-                    State0 = #state{cfg = #cfg{client_id = ClientId}}) ->
+                    State0 = #state{cfg = #cfg{client_id = ClientId, proto_ver = ProtoVer}}) ->
+    rabbit_global_counters:messages_received(ProtoVer, 1),
     %% Answers to a CALL of the CSMS carry the action of that CALL, so that
     %% workers can bind to e.g. ocpp16.GetConfiguration.conf.
     {Action, State1} = case is_response(Type) of
@@ -281,7 +293,7 @@ handle_ocpp_message({Type, MsgId, Action0, _Payload}, Data,
                        action = Action,
                        payload = Data,
                        client_id = ClientId},
-    case publish(McOcpp, State1) of
+    case publish(McOcpp, #{flow => flow}, State1) of
         {ok, unroutable, State2} when Type =:= ?OCPP_MESSAGE_TYPE_CALL ->
             %% Nobody would answer. Do not let the charge point wait for a
             %% timeout (and maybe retry or reboot) [OCPP-J 4.2.3].
@@ -300,11 +312,8 @@ is_response(Type) ->
     Type =:= ?OCPP_MESSAGE_TYPE_CALLRESULTERROR.
 
 %% Publishes a message of the charge point to the exchange.
--spec publish(#ocpp_msg{}, state()) ->
+-spec publish(#ocpp_msg{}, rabbit_queue_type:delivery_options(), state()) ->
     {ok, {routed, [rabbit_amqqueue:name()]} | unroutable, state()} | {error, term(), state()}.
-publish(McOcpp, State) ->
-    publish(McOcpp, #{}, State).
-
 publish(McOcpp = #ocpp_msg{}, Options,
         State = #state{cfg = #cfg{exchange = ExchangeName = #resource{name = ExchangeNameBin},
                                   client_id = ClientId,
@@ -473,6 +482,7 @@ handle_info(Msg, State = #state{cfg = #cfg{client_id = ClientId}}) ->
     {ok, state(), cowboy_websocket:commands()} | {stop, term(), state()}.
 handle_down({{'DOWN', QName}, _MRef, process, QPid, Reason},
             State0 = #state{queue_states = QStates0}) ->
+    credit_flow:peer_down(QPid),
     try
         case rabbit_queue_type:handle_down(QPid, QName, Reason, QStates0) of
             {ok, QStates, Actions} ->
@@ -507,7 +517,9 @@ drain_frames(State = #state{pending_frames = Frames}) ->
 -spec terminate(any(), rabbit_event:event_props(), state()) -> ok.
 terminate(Reason, Infos, State = #state{queue_states = QStates,
                                         publish_offline = PublishOffline,
-                                        cfg = #cfg{client_id = ClientId}}) ->
+                                        cfg = #cfg{client_id = ClientId,
+                                                   proto_ver = ProtoVer}}) ->
+    rabbit_global_counters:consumer_deleted(ProtoVer),
     ?LOG_INFO("OCPP processor terminating. ClientId: ~ts, Reason: ~p", [ClientId, Reason]),
     %% Tell the backends the charge point went offline with one final
     %% synthetic StatusNotification, unless the charge point reconnected.
@@ -642,12 +654,10 @@ handle_queue_actions([{deliver, _ConsumerTag, _AckRequired, Msgs} | Rest], State
     handle_queue_actions(Rest, State1);
 handle_queue_actions([{queue_down, QName} | Rest], State) ->
     handle_queue_actions(Rest, handle_queue_down(QName, State));
-handle_queue_actions([{block, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
-    ?LOG_DEBUG("OCPP queue ~ts blocked for ClientId ~ts", [rabbit_misc:rs(QName), ClientId]),
-    handle_queue_actions(Rest, State);
-handle_queue_actions([{unblock, QName} | Rest], State = #state{cfg = #cfg{client_id=ClientId}}) ->
-    ?LOG_DEBUG("OCPP queue ~ts unblocked for ClientId ~ts", [rabbit_misc:rs(QName), ClientId]),
-    handle_queue_actions(Rest, State);
+handle_queue_actions([{block, QName} | Rest], State = #state{blocked_queues = Blocked}) ->
+    handle_queue_actions(Rest, State#state{blocked_queues = lists:usort([QName | Blocked])});
+handle_queue_actions([{unblock, QName} | Rest], State = #state{blocked_queues = Blocked}) ->
+    handle_queue_actions(Rest, State#state{blocked_queues = lists:delete(QName, Blocked)});
 handle_queue_actions([Action | Rest], State) ->
     ?LOG_DEBUG("OCPP unhandled queue action: ~p", [Action]),
     handle_queue_actions(Rest, State).
@@ -655,7 +665,7 @@ handle_queue_actions([Action | Rest], State) ->
 %% Deliver a message from the charge point queue to the charge point.
 %% Outbound frames are buffered into State#state.pending_frames and returned
 %% to cowboy by the caller.
-deliver_to_client({QName, QPid, QMsgId, _Redelivered, Mc} = Delivery,
+deliver_to_client({QName, QPid, QMsgId, Redelivered, Mc} = Delivery,
                   State0 = #state{cfg = #cfg{client_id = ClientId,
                                              trace_state = TraceState,
                                              conn_name = ConnName},
@@ -664,6 +674,7 @@ deliver_to_client({QName, QPid, QMsgId, _Redelivered, Mc} = Delivery,
                 #ocpp_msg{payload = Payload0} = mc:protocol_state(mc:convert(mc_ocpp, Mc, #{})),
                 Payload = iolist_to_binary(Payload0),
                 rabbit_trace:tap_out(Delivery, ConnName, User#user.username, TraceState),
+                count_delivery(QName, Redelivered, State0),
                 case classify_outbound(Payload) of
                     {call, MsgId, Action} ->
                         %% Sent once the outstanding CALL, if any, completed.
@@ -731,8 +742,32 @@ complete_call(MsgId, State0 = #state{outstanding_call = #call{msg_id = MsgId,
 complete_call(_MsgId, State) ->
     {undefined, State}.
 
+count_delivery(QName, Redelivered, #state{queue_states = QStates,
+                                          cfg = #cfg{proto_ver = ProtoVer}}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, QType} ->
+            rabbit_global_counters:messages_delivered(ProtoVer, QType, 1),
+            rabbit_global_counters:messages_delivered_consume_manual_ack(ProtoVer, QType, 1),
+            case Redelivered of
+                true -> rabbit_global_counters:messages_redelivered(ProtoVer, QType, 1);
+                false -> ok
+            end;
+        _ ->
+            ok
+    end.
+
 settle(QName, Op, QMsgId, State = #state{queue_states = QStates0,
-                                         cfg = #cfg{consumer_tag = ConsumerTag}}) ->
+                                         cfg = #cfg{consumer_tag = ConsumerTag,
+                                                    proto_ver = ProtoVer}}) ->
+    case Op of
+        complete ->
+            case rabbit_queue_type:module(QName, QStates0) of
+                {ok, QType} -> rabbit_global_counters:messages_acknowledged(ProtoVer, QType, 1);
+                _ -> ok
+            end;
+        _ ->
+            ok
+    end,
     case rabbit_queue_type:settle(QName, Op, ConsumerTag, [QMsgId], QStates0) of
         {ok, QStates, Actions} ->
             handle_queue_actions(Actions, State#state{queue_states = QStates});

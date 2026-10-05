@@ -14,6 +14,7 @@
          exchange/0,
          ensure_exchange/2,
          ensure_exchanges/0,
+         ensure_exchanges/1,
          validate_client_id/1,
          allowed_protocols/0]).
 
@@ -59,6 +60,10 @@ ensure_exchange(XName, Username) ->
 
 -spec ensure_exchanges() -> ok.
 ensure_exchanges() ->
+    ensure_exchanges(rabbit_vhost:list_names()).
+
+-spec ensure_exchanges([rabbit_types:vhost()]) -> ok.
+ensure_exchanges(Vhosts) ->
     lists:foreach(
       fun(Vhost) ->
               XName = rabbit_misc:r(Vhost, exchange, exchange()),
@@ -69,7 +74,7 @@ ensure_exchanges() ->
                       ?LOG_WARNING("Web OCPP could not declare ~ts: ~p",
                                    [rabbit_misc:rs(XName), Reason])
               end
-      end, rabbit_vhost:list_names()).
+      end, Vhosts).
 
 %% The client ID is the binding key of the charge point queue on a topic
 %% exchange and part of the routing key of everything the CSMS sends it. It
