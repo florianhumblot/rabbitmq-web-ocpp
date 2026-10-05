@@ -1,6 +1,7 @@
 package demo.csms.monitor;
 
 import demo.csms.config.AmqpConfig;
+import demo.csms.config.ConditionalOnRole;
 import demo.csms.config.CsmsProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,6 +13,7 @@ import tools.jackson.databind.JsonNode;
 
 /** Polls the RabbitMQ management API for broker-wide figures. */
 @Component
+@ConditionalOnRole(ConditionalOnRole.DASHBOARD)
 public class BrokerStats {
 
     private static final Logger log = LoggerFactory.getLogger(BrokerStats.class);

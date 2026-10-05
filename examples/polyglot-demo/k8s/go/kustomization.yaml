@@ -1,0 +1,50 @@
+# The go CSMS in namespace csms-go, against the shared broker and
+# Valkey of ../infra (vhost csms-go).
+#
+#   kubectl apply -k k8s/go
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: csms-go
+resources:
+  - namespace.yaml
+  - ../csms
+# Scale workers on queue depth and message rate instead of CPU (needs KEDA):
+# components:
+#   - ../keda
+images:
+  - name: csms
+    newName: ocpp-polyglot/csms-go
+    newTag: local
+configMapGenerator:
+  - name: csms-config
+    behavior: merge
+    literals:
+      - RABBITMQ_VHOST=csms-go
+secretGenerator:
+  # Read by ../keda's TriggerAuthentication when that component is enabled.
+  - name: keda-rabbitmq
+    literals:
+      - host=http://csms:csms@rabbitmq.ocpp.svc.cluster.local:15672/csms-go
+patches:
+  # One image, one binary per role.
+  - target:
+      kind: Deployment
+      name: csms-worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["ocpp-worker"]
+  - target:
+      kind: Deployment
+      name: csms-api
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["command-api"]
+  - target:
+      kind: Deployment
+      name: csms-dashboard
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/command
+        value: ["dashboard"]

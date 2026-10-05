@@ -1,9 +1,10 @@
 package demo.csms.dashboard;
 
+import demo.csms.config.ConditionalOnRole;
 import demo.csms.config.CsmsProperties;
 import demo.csms.monitor.BrokerStats;
-import demo.csms.monitor.ChargerRegistry;
 import demo.csms.monitor.TrafficStats;
+import demo.csms.registry.Registry;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
@@ -23,30 +24,31 @@ import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorato
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 import tools.jackson.databind.json.JsonMapper;
 
-/** Pushes one JSON snapshot per second to every dashboard on {@code /ws}. */
+/**
+ * Pushes one JSON snapshot per second to every dashboard on {@code /ws}. Replicas are
+ * interchangeable: each taps the same traffic and reads the same registry, so a browser
+ * reconnecting to another replica sees the same picture.
+ */
 @Configuration
+@ConditionalOnRole(ConditionalOnRole.DASHBOARD)
 @EnableWebSocket
 public class DashboardSocket extends TextWebSocketHandler implements WebSocketConfigurer {
 
-    public record Chargers(long known, long online, Map<String, Long> byVersion,
-                           Map<String, Long> bySecurityProfile) {
-    }
-
     public record Snapshot(String implementation, String instance, long uptimeSeconds, long timestamp,
-                           Chargers chargers, Map<String, Long> connectors, TrafficStats.Traffic traffic,
+                           Registry.Summary chargers, Map<String, Long> connectors, TrafficStats.Traffic traffic,
                            TrafficStats.Latency latency, TrafficStats.Commands commands,
                            BrokerStats.View broker, List<TrafficStats.RecentFrame> recent) {
     }
 
     private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
     private final JsonMapper json;
-    private final ChargerRegistry registry;
+    private final Registry registry;
     private final TrafficStats stats;
     private final BrokerStats broker;
     private final String implementation;
     private final String instance;
 
-    public DashboardSocket(JsonMapper json, ChargerRegistry registry, TrafficStats stats, BrokerStats broker,
+    public DashboardSocket(JsonMapper json, Registry registry, TrafficStats stats, BrokerStats broker,
                            CsmsProperties properties) throws IOException {
         this.json = json;
         this.registry = registry;
@@ -78,11 +80,10 @@ public class DashboardSocket extends TextWebSocketHandler implements WebSocketCo
         if (sessions.isEmpty()) {
             return;
         }
-        ChargerRegistry.Summary summary = registry.summary();
+        Map.Entry<Registry.Summary, Map<String, Long>> summary = registry.summary();
         Snapshot snapshot = new Snapshot(implementation, instance,
                 ManagementFactory.getRuntimeMXBean().getUptime() / 1000, System.currentTimeMillis(),
-                new Chargers(summary.known(), summary.online(), summary.byVersion(), summary.bySecurityProfile()),
-                summary.connectors(), window.traffic(), window.latency(), window.commands(),
+                summary.getKey(), summary.getValue(), window.traffic(), window.latency(), window.commands(),
                 broker.current(), window.recent());
         TextMessage message = new TextMessage(json.writeValueAsString(snapshot));
         for (WebSocketSession session : sessions) {

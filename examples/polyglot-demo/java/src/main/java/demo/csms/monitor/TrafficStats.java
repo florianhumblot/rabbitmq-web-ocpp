@@ -1,5 +1,6 @@
 package demo.csms.monitor;
 
+import demo.csms.config.ConditionalOnRole;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -14,6 +15,7 @@ import org.springframework.stereotype.Component;
  * the broker until the CSMS answer is seen on the broker) and command outcomes.
  */
 @Component
+@ConditionalOnRole(ConditionalOnRole.DASHBOARD)
 public class TrafficStats {
 
     public record RecentFrame(long ts, String direction, String chargerId, String kind, String action,

@@ -1,0 +1,27 @@
+# The rust CSMS in namespace csms-rust, against the shared broker and
+# Valkey of ../infra (vhost csms-rust).
+#
+#   kubectl apply -k k8s/rust
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: csms-rust
+resources:
+  - namespace.yaml
+  - ../csms
+# Scale workers on queue depth and message rate instead of CPU (needs KEDA):
+# components:
+#   - ../keda
+images:
+  - name: csms
+    newName: ocpp-polyglot/csms-rust
+    newTag: local
+configMapGenerator:
+  - name: csms-config
+    behavior: merge
+    literals:
+      - RABBITMQ_VHOST=csms-rust
+secretGenerator:
+  # Read by ../keda's TriggerAuthentication when that component is enabled.
+  - name: keda-rabbitmq
+    literals:
+      - host=http://csms:csms@rabbitmq.ocpp.svc.cluster.local:15672/csms-rust

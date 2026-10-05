@@ -1,0 +1,38 @@
+# The java CSMS in namespace csms-java, against the shared broker and
+# Valkey of ../infra (vhost csms-java).
+#
+#   kubectl apply -k k8s/java
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: csms-java
+resources:
+  - namespace.yaml
+  - ../csms
+# Scale workers on queue depth and message rate instead of CPU (needs KEDA):
+# components:
+#   - ../keda
+images:
+  - name: csms
+    newName: ocpp-polyglot/csms-java
+    newTag: local
+configMapGenerator:
+  - name: csms-config
+    behavior: merge
+    literals:
+      - RABBITMQ_VHOST=csms-java
+secretGenerator:
+  # Read by ../keda's TriggerAuthentication when that component is enabled.
+  - name: keda-rabbitmq
+    literals:
+      - host=http://csms:csms@rabbitmq.ocpp.svc.cluster.local:15672/csms-java
+patches:
+  # The JVM needs more memory than the native binaries.
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 384Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 768Mi

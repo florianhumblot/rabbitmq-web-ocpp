@@ -1,6 +1,7 @@
 package demo.csms.command;
 
-import demo.csms.monitor.ChargerRegistry;
+import demo.csms.config.ConditionalOnRole;
+import demo.csms.registry.Registry;
 import demo.csms.ocpp.Ocpp;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,10 +22,11 @@ import tools.jackson.databind.node.JsonNodeFactory;
 
 /**
  * Version-neutral command API. The request is translated to the OCPP 1.6 or 2.x payload based
- * on the protocol the charger connected with (learned from its traffic), or on an explicit
- * {@code ocppVersion} field in the body.
+ * on the protocol recorded in the shared registry, or on an explicit {@code ocppVersion} field in
+ * the body. Stateless: any instance can serve any request.
  */
 @RestController
+@ConditionalOnRole(ConditionalOnRole.API)
 @RequestMapping("/api/chargers")
 public class CommandController {
 
@@ -32,24 +34,23 @@ public class CommandController {
     private static final Set<String> TRIGGERABLE =
             Set.of("BootNotification", "Heartbeat", "MeterValues", "StatusNotification");
 
-    private final ChargerRegistry registry;
+    private final Registry registry;
     private final CommandGateway gateway;
 
-    public CommandController(ChargerRegistry registry, CommandGateway gateway) {
+    public CommandController(Registry registry, CommandGateway gateway) {
         this.registry = registry;
         this.gateway = gateway;
     }
 
     @GetMapping
-    public List<ChargerRegistry.ChargerView> list(@RequestParam(defaultValue = "100") int limit) {
+    public List<Registry.ChargerView> list(@RequestParam(defaultValue = "100") int limit) {
         return registry.list(Math.max(0, limit));
     }
 
     @GetMapping("/{id}")
     public ResponseEntity<?> get(@PathVariable String id) {
-        ChargerRegistry.Charger charger = registry.get(id);
-        return charger == null ? error(HttpStatus.NOT_FOUND, "unknown charge point " + id)
-                : ResponseEntity.ok(charger.view());
+        return registry.get(id).<ResponseEntity<?>>map(ResponseEntity::ok)
+                .orElseGet(() -> error(HttpStatus.NOT_FOUND, "unknown charge point " + id));
     }
 
     @PostMapping("/{id}/reset")
@@ -115,7 +116,7 @@ public class CommandController {
             return error(HttpStatus.BAD_REQUEST, "ocppVersion must be one of " + VERSIONS);
         }
         if (version == null) {
-            ChargerRegistry.Charger charger = registry.get(id);
+            Registry.Lookup charger = registry.lookup(id).orElse(null);
             if (charger == null) {
                 return error(HttpStatus.NOT_FOUND, "unknown charge point " + id + " (pass ocppVersion to force)");
             }

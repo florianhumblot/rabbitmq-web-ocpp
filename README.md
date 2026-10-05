@@ -75,7 +75,7 @@ The communication flow is straightforward:
 
 ## Examples
 
-Worker examples for [Python](examples/python), [PHP](examples/php) and [.NET](examples/dotnet), plus a [polyglot demo](examples/polyglot-demo) running the same CSMS in Java, Rust and Go with a live dashboard and a Gatling load test of 10,000 OCPP 1.6 / 2.1 chargers across Security Profiles 1, 2 and 3.
+Worker examples for [Python](examples/python), [PHP](examples/php) and [.NET](examples/dotnet), plus a [polyglot demo](examples/polyglot-demo) running the same horizontally scalable CSMS in Java, Rust and Go (Compose and Kubernetes, rolling deployments, autoscaling) with a live dashboard and a Gatling load test of 10,000 OCPP 1.6 / 2.1 chargers across Security Profiles 1, 2 and 3.
 
 ## Offline Detection
 

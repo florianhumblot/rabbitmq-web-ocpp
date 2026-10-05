@@ -1,6 +1,6 @@
 //! Dashboard: the shared page at `/` and one JSON snapshot per second on `/ws`.
 
-use crate::{App, amqp::now_ms, broker::BrokerView, monitor};
+use crate::{App, amqp::now_ms, broker::BrokerView, monitor, registry};
 use axum::{
     extract::{
         State,
@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tracing::warn;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +19,7 @@ struct Snapshot<'a> {
     instance: &'a str,
     uptime_seconds: u64,
     timestamp: u64,
-    chargers: monitor::ChargerSummary,
+    chargers: registry::Summary,
     connectors: BTreeMap<String, u64>,
     traffic: monitor::Traffic,
     latency: monitor::Latency,
@@ -42,10 +43,13 @@ pub async fn publish_snapshots(app: Arc<App>) {
         if app.snapshots.receiver_count() == 0 {
             continue;
         }
-        let (chargers, connectors) = app.registry.lock().unwrap().summary();
+        let (chargers, connectors) = app.registry.summary().await.unwrap_or_else(|e| {
+            warn!("registry summary failed: {e}");
+            Default::default()
+        });
         let snapshot = Snapshot {
             implementation: "rust",
-            instance: &app.instance,
+            instance: &app.hostname,
             uptime_seconds: app.started.elapsed().as_secs(),
             timestamp: now,
             chargers,
@@ -81,6 +85,8 @@ async fn stream(app: Arc<App>, mut socket: WebSocket) {
                 Err(_) => return,
             },
             incoming = socket.recv() => if !matches!(incoming, Some(Ok(_))) { return },
+            // On shutdown the browser reconnects to another replica.
+            _ = app.shutdown.cancelled() => return,
         }
     }
 }

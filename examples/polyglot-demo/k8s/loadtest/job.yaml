@@ -1,0 +1,32 @@
+# Reads the fleet (passwords, client certificates) from the PVC the broker's
+# provision init container fills; see ../infra/rabbitmq.yaml about access modes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gatling
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: gatling
+          image: ocpp-polyglot/gatling:local
+          envFrom:
+            - configMapRef:
+                name: gatling-config
+          env:
+            - name: DATA_DIR
+              value: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: fleet
+              mountPath: /data
+              readOnly: true
+      volumes:
+        - name: fleet
+          persistentVolumeClaim:
+            claimName: fleet

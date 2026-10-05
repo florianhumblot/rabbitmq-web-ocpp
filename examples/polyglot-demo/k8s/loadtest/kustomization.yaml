@@ -1,0 +1,24 @@
+# Gatling against one implementation, from inside the cluster. Point
+# VHOST and CSMS_API below to the implementation (csms-java, csms-rust or
+# csms-go), then:
+#
+#   kubectl delete job -n ocpp gatling --ignore-not-found
+#   kubectl apply -k k8s/loadtest && kubectl logs -n ocpp -f job/gatling
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ocpp
+resources:
+  - job.yaml
+configMapGenerator:
+  - name: gatling-config
+    literals:
+      - VHOST=csms-go
+      - CSMS_API=http://csms-api.csms-go.svc.cluster.local:8080
+      - TARGET_HOST=rabbitmq.ocpp.svc.cluster.local
+      - CHARGERS=3000
+      - RAMP_SECONDS=90
+      - DURATION_SECONDS=600
+      - COMMANDS_PER_SEC=5
+      - GATLING_HEAP=2g
+generatorOptions:
+  disableNameSuffixHash: true

@@ -1,0 +1,108 @@
+# Single-node RabbitMQ with rabbitmq_web_ocpp. Chargers connect here; the
+# CSMS deployments never hold a charger connection, so rolling them does not
+# disconnect anyone.
+#
+# The provision init container generates the fleet (users, passwords,
+# certificates, definitions) into the "fleet" volume, which the load test
+# reads too. It is ReadWriteOnce: fine on a single-node cluster like kind;
+# on a multi-node cluster use a ReadWriteMany storage class or pin the
+# load-test job to the broker's node. For a production broker use a 3-node
+# cluster (e.g. the RabbitMQ Cluster Operator): the plugin's per-charger
+# routing works across cluster nodes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fleet
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  labels:
+    app: rabbitmq
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+    - name: management
+      port: 15672
+    - name: ocpp-ws # Security Profile 1
+      port: 19520
+    - name: ocpp-wss # Security Profiles 2 and 3
+      port: 19521
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      initContainers:
+        - name: provision
+          image: ocpp-polyglot/provision:local
+          envFrom:
+            - configMapRef:
+                name: fleet-config
+          volumeMounts:
+            - name: fleet
+              mountPath: /out
+      containers:
+        - name: rabbitmq
+          image: ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp
+          ports:
+            - containerPort: 5672
+            - containerPort: 15672
+            - containerPort: 19520
+            - containerPort: 19521
+          readinessProbe:
+            # check_running only passes once the definitions (10k users) are imported.
+            exec:
+              command: ["sh", "-c", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+            periodSeconds: 10
+            timeoutSeconds: 10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 6Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rabbitmq/conf.d/90-demo.conf
+              subPath: rabbitmq.conf
+            - name: fleet
+              mountPath: /etc/rabbitmq/demo
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/rabbitmq
+      volumes:
+        - name: config
+          configMap:
+            name: rabbitmq-config
+        - name: fleet
+          persistentVolumeClaim:
+            claimName: fleet
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi

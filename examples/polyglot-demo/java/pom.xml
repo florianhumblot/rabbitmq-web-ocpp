@@ -38,6 +38,14 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-restclient</artifactId>
     </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
   </dependencies>
 
   <build>
@@ -45,10 +53,16 @@
       <resource>
         <directory>src/main/resources</directory>
       </resource>
-      <!-- The dashboard page is shared by all implementations. -->
+      <!-- The dashboard page and the registry script are shared by all implementations. -->
       <resource>
         <directory>../dashboard</directory>
         <targetPath>static</targetPath>
+      </resource>
+      <resource>
+        <directory>../valkey</directory>
+        <includes>
+          <include>registry.lua</include>
+        </includes>
       </resource>
     </resources>
     <plugins>

@@ -8,6 +8,7 @@ public record CsmsProperties(
         String implementation,
         int heartbeatInterval,
         Duration commandTimeout,
+        String commandApiUrl,
         String managementUrl,
         String managementUser,
         String managementPassword,

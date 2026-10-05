@@ -1,0 +1,25 @@
+# Shared infrastructure: RabbitMQ with the OCPP plugin, the generated fleet,
+# and Valkey for the charger registry. Every CSMS implementation (../java,
+# ../rust, ../go) runs in its own namespace against these.
+#
+#   kubectl apply -k k8s/infra
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ocpp
+resources:
+  - namespace.yaml
+  - rabbitmq.yaml
+  - valkey.yaml
+configMapGenerator:
+  - name: rabbitmq-config
+    files:
+      - rabbitmq.conf
+  - name: fleet-config
+    literals:
+      - CHARGERS=10000
+      - OCPP21_PCT=50
+      - SP1_PCT=40
+      - SP2_PCT=30
+      - SP3_PCT=30
+      # Names the broker certificate must carry.
+      - SERVER_SANS=rabbitmq,rabbitmq.ocpp,rabbitmq.ocpp.svc,rabbitmq.ocpp.svc.cluster.local,localhost

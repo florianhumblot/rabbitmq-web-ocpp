@@ -1,0 +1,17 @@
+# Kustomize component: scale the workers with KEDA on what matters for a
+# queue consumer, replacing the CPU-based HPA of ../csms:
+#   - backlog: messages waiting in csms.requests, per replica
+#   - throughput: publish rate into csms.requests, per replica
+# KEDA takes the higher of the two. Enable it in an overlay with
+#   components: [../keda]
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - scaledobject.yaml
+patches:
+  - patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: csms-worker

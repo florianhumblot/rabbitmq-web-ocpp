@@ -1,0 +1,30 @@
+# One CSMS implementation as three independently scaled deployments:
+#   csms-worker     answers charger requests from csms.requests (scaled on load)
+#   csms-api        command API (scaled on load)
+#   csms-dashboard  dashboard; two replicas for availability
+# Overlays (../java, ../rust, ../go) set the namespace, image and vhost.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - worker.yaml
+  - api.yaml
+  - dashboard.yaml
+  - hpa.yaml
+configMapGenerator:
+  - name: csms-config
+    literals:
+      - RABBITMQ_HOST=rabbitmq.ocpp.svc.cluster.local
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_MANAGEMENT_URL=http://rabbitmq.ocpp.svc.cluster.local:15672
+      - VALKEY_HOST=valkey.ocpp.svc.cluster.local
+      - HTTP_PORT=8080
+      - HEARTBEAT_INTERVAL=60
+      - PREFETCH=200
+      - COMMAND_TIMEOUT_MS=15000
+      # Below terminationGracePeriodSeconds, minus the preStop pause.
+      - SHUTDOWN_TIMEOUT_MS=25000
+secretGenerator:
+  - name: csms-rabbitmq
+    literals:
+      - RABBITMQ_USER=csms
+      - RABBITMQ_PASS=csms

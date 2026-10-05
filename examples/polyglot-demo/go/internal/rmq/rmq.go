@@ -7,9 +7,11 @@ package rmq
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -20,6 +22,9 @@ const (
 	// RequestsQueue is the shared work queue: every charger-initiated CALL,
 	// consumed by competing workers.
 	RequestsQueue = "csms.requests"
+	// ResponsesQueue receives the chargers' answers to CSMS commands,
+	// consumed by competing command API instances.
+	ResponsesQueue = "csms.responses"
 )
 
 // Dial connects, retrying until the broker is up. Any later connection loss
@@ -42,12 +47,28 @@ func Dial(uri, name string) *amqp.Connection {
 	}
 }
 
-// DeclareRequestsQueue declares the shared work queue and its binding.
-func DeclareRequestsQueue(ch *amqp.Channel) error {
-	if _, err := ch.QueueDeclare(RequestsQueue, true, false, false, false, nil); err != nil {
+func declareShared(ch *amqp.Channel, queue string, keys ...string) error {
+	// Durable classic queues: the plugin publishes into them directly, and
+	// does not yet keep the client state quorum queues need.
+	if _, err := ch.QueueDeclare(queue, true, false, false, false, nil); err != nil {
 		return err
 	}
-	return ch.QueueBind(RequestsQueue, "*.*.req", Exchange, false, nil)
+	for _, key := range keys {
+		if err := ch.QueueBind(queue, key, Exchange, false, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeclareRequestsQueue declares the shared work queue and its binding.
+func DeclareRequestsQueue(ch *amqp.Channel) error {
+	return declareShared(ch, RequestsQueue, "*.*.req")
+}
+
+// DeclareResponsesQueue declares the shared queue of command answers.
+func DeclareResponsesQueue(ch *amqp.Channel) error {
+	return declareShared(ch, ResponsesQueue, "*.response.conf", "*.response.error")
 }
 
 // DeclareTap declares an exclusive, auto-deleted, server-named queue bound to
@@ -86,4 +107,37 @@ func formatMillis(d time.Duration) string {
 		return ""
 	}
 	return strconv.FormatInt(d.Milliseconds(), 10)
+}
+
+// Presence tells whether a charger is connected right now: the plugin
+// consumes the charger's queue (ocpp.<id>) for as long as its WebSocket is
+// open, on whichever broker node it is connected to. A passive declare
+// returns the consumer count without changing anything.
+type Presence struct {
+	conn *amqp.Connection
+	mu   sync.Mutex
+	ch   *amqp.Channel
+}
+
+func NewPresence(conn *amqp.Connection) *Presence { return &Presence{conn: conn} }
+
+func (p *Presence) Connected(_ context.Context, chargerID string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ch == nil || p.ch.IsClosed() {
+		ch, err := p.conn.Channel()
+		if err != nil {
+			return false, err
+		}
+		p.ch = ch
+	}
+	q, err := p.ch.QueueDeclarePassive("ocpp."+chargerID, true, false, false, false, nil)
+	if err != nil {
+		var amqpErr *amqp.Error
+		if errors.As(err, &amqpErr) && amqpErr.Code == amqp.NotFound {
+			return false, nil // never connected; the broker closed the channel
+		}
+		return false, err
+	}
+	return q.Consumers > 0, nil
 }

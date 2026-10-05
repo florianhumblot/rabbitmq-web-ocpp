@@ -1,19 +1,22 @@
 // Command command-api is the version-neutral CSMS command API.
 //
 // A request is translated to the OCPP 1.6 or 2.x payload based on the
-// protocol the charger connected with, or on an explicit ocppVersion field in
-// the body. The CALL is published to amq.topic with the charge point id as
-// routing key; the plugin queues it in the charger's own queue. The answer
-// comes back as <protocol>.response.conf|error.
+// protocol recorded in the shared registry, or on an explicit ocppVersion
+// field in the body. The CALL is published to amq.topic with the charge point
+// id as routing key; the plugin queues it in the charger's own queue.
 //
-// The service learns about chargers from its own tap on all charger-sent
-// frames (*.*.req and *.response.*), which also delivers command answers.
-// Every replica taps all answers, so only the one holding the pending call
-// completes it.
+// Any number of replicas can run behind a load balancer. The charger's answer
+// (<protocol>.response.conf|error) lands in the shared csms.responses queue
+// and may be consumed by any replica. The OCPP message id starts with the id
+// of the instance that sent the command, so a replica that receives somebody
+// else's answer forwards it to that instance's private queue: at most one
+// extra hop, and no instance sees all answers.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,12 +31,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/env"
-	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/monitor"
+	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/health"
+	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/lifecycle"
 	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/ocpp"
+	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/registry"
 	"github.com/vampirebyte/rabbitmq-web-ocpp/examples/polyglot-demo/go/internal/rmq"
 )
 
@@ -42,10 +46,13 @@ var (
 	triggerable = []string{"BootNotification", "Heartbeat", "MeterValues", "StatusNotification"}
 )
 
+const replyQueuePrefix = "csms.replies."
+
 type key struct{ chargerID, messageID string }
 
 type api struct {
-	registry  *monitor.Registry
+	instance  string
+	registry  *registry.Registry
 	publisher *amqp.Channel
 	timeout   time.Duration
 
@@ -53,78 +60,149 @@ type api struct {
 	pending map[key]chan ocpp.Frame
 }
 
+func randomHex(n int) string {
+	b := make([]byte, (n+1)/2)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)[:n]
+}
+
+// newMessageID returns "<instance>-<random>", 36 characters: the maximum
+// length of an OCPP message id.
+func (a *api) newMessageID() string { return a.instance + "-" + randomHex(27) }
+
+// ownerOf extracts the instance id from a message id made by newMessageID.
+func ownerOf(messageID string) string {
+	if len(messageID) != 36 || messageID[8] != '-' {
+		return ""
+	}
+	return messageID[:8]
+}
+
 func main() {
 	cfg := env.LoadRabbitMQ()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	conn := rmq.Dial(cfg.URI(), "csms-go-command-api")
-	defer conn.Close()
+	reg, err := registry.New(cfg.Vhost)
+	if err != nil {
+		lifecycle.Fatal("registry", err)
+	}
 	a := &api{
-		registry: monitor.NewRegistry(),
+		instance: randomHex(8),
+		registry: reg,
 		timeout:  env.Millis("COMMAND_TIMEOUT_MS", 15000),
 		pending:  map[key]chan ocpp.Frame{},
 	}
-	var err error
+	conn := rmq.Dial(cfg.URI(), "csms-go-command-api-"+a.instance)
 	if a.publisher, err = conn.Channel(); err != nil {
-		fatal("channel", err)
+		lifecycle.Fatal("channel", err)
 	}
-	tapCh, err := conn.Channel()
-	if err != nil {
-		fatal("channel", err)
-	}
-	tap, err := rmq.DeclareTap(tapCh, "*.*.req", "*.response.conf", "*.response.error")
-	if err != nil {
-		fatal("declare tap", err)
-	}
-	_ = tapCh.Qos(1000, 0, false)
-	deliveries, err := tapCh.Consume(tap, "csms-go-command-api", true, true, false, false, nil)
-	if err != nil {
-		fatal("consume", err)
-	}
-	go a.consumeTap(deliveries)
 
+	// The shared queue of answers, consumed by all replicas...
+	sharedCh, err := conn.Channel()
+	if err != nil {
+		lifecycle.Fatal("channel", err)
+	}
+	if err := rmq.DeclareResponsesQueue(sharedCh); err != nil {
+		lifecycle.Fatal("declare topology", err)
+	}
+	_ = sharedCh.Qos(200, 0, false)
+	shared, err := sharedCh.Consume(rmq.ResponsesQueue, "csms-go-api-"+a.instance, false, false, false, false, nil)
+	if err != nil {
+		lifecycle.Fatal("consume", err)
+	}
+	// ...and this instance's private queue, for answers forwarded by others.
+	privateCh, err := conn.Channel()
+	if err != nil {
+		lifecycle.Fatal("channel", err)
+	}
+	if _, err := privateCh.QueueDeclare(replyQueuePrefix+a.instance, false, true, true, false, nil); err != nil {
+		lifecycle.Fatal("declare reply queue", err)
+	}
+	private, err := privateCh.Consume(replyQueuePrefix+a.instance, "", true, true, false, false, nil)
+	if err != nil {
+		lifecycle.Fatal("consume", err)
+	}
+	var consumers sync.WaitGroup
+	consumers.Add(2)
+	go func() { defer consumers.Done(); a.consumeShared(ctx, shared) }()
+	go func() { defer consumers.Done(); a.consumePrivate(ctx, private) }()
+
+	h := health.New(map[string]health.Check{"rabbitmq": lifecycle.AMQPConnected(conn), "valkey": reg.Ping})
 	mux := http.NewServeMux()
+	h.Register(mux)
 	mux.HandleFunc("GET /api/chargers", a.list)
 	mux.HandleFunc("GET /api/chargers/{id}", a.get)
 	mux.HandleFunc("POST /api/chargers/{id}/reset", a.reset)
 	mux.HandleFunc("POST /api/chargers/{id}/change-availability", a.changeAvailability)
 	mux.HandleFunc("POST /api/chargers/{id}/trigger-message", a.triggerMessage)
 	server := &http.Server{Addr: ":" + env.String("HTTP_PORT", "8080"), Handler: mux}
-	go func() {
-		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
-	}()
-	slog.Info("command-api listening", "addr", server.Addr, "vhost", cfg.Vhost)
-	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		fatal("http server", err)
+	lifecycle.Serve(server)
+	h.SetReady(true)
+	slog.Info("command-api listening", "addr", server.Addr, "vhost", cfg.Vhost, "instance", a.instance)
+
+	<-ctx.Done()
+	// Drain: leave the shared queue to the other replicas (they forward our
+	// answers to our private queue), finish the requests in flight, then go.
+	h.SetReady(false)
+	slog.Info("draining")
+	_ = sharedCh.Cancel("csms-go-api-"+a.instance, false)
+	lifecycle.Shutdown(server, env.ShutdownTimeout())
+	_ = conn.Close()
+	lifecycle.WaitTimeout(&consumers, 2*time.Second)
+	_ = reg.Close()
+	slog.Info("stopped")
+}
+
+func (a *api) complete(chargerID, messageID string, body []byte) bool {
+	a.mu.Lock()
+	waiter := a.pending[key{chargerID, messageID}]
+	delete(a.pending, key{chargerID, messageID})
+	a.mu.Unlock()
+	if waiter == nil {
+		return false
 	}
+	if frame, _, _, ok := ocpp.Decode(body); ok {
+		waiter <- frame
+	}
+	return true
 }
 
-func fatal(msg string, err error) {
-	slog.Error(msg, "err", err)
-	os.Exit(1)
-}
-
-func (a *api) consumeTap(deliveries <-chan amqp.Delivery) {
+func (a *api) consumeShared(ctx context.Context, deliveries <-chan amqp.Delivery) {
 	for d := range deliveries {
-		ev, ok := monitor.Classify(d)
-		if !ok || !ev.FromCharger {
-			continue
-		}
-		a.registry.Apply(ev)
-		if ev.Key.Direction != "req" {
-			a.mu.Lock()
-			waiter := a.pending[key{ev.ChargerID, ev.MessageID}]
-			delete(a.pending, key{ev.ChargerID, ev.MessageID})
-			a.mu.Unlock()
-			if waiter != nil {
-				waiter <- ev.Frame
+		owner := ownerOf(d.CorrelationId)
+		switch {
+		case owner == a.instance:
+			a.complete(d.ReplyTo, d.CorrelationId, d.Body)
+		case owner != "":
+			// Somebody else's answer: forward through the default exchange. If
+			// that instance is gone, the message is unroutable and dropped,
+			// like its HTTP request.
+			fwdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := a.publisher.PublishWithContext(fwdCtx, "", replyQueuePrefix+owner, false, false, amqp.Publishing{
+				ContentType: d.ContentType, CorrelationId: d.CorrelationId, ReplyTo: d.ReplyTo, Body: d.Body,
+			})
+			cancel()
+			if err != nil {
+				slog.Error("forward failed", "owner", owner, "err", err)
+				_ = d.Nack(false, true)
+				continue
 			}
 		}
+		_ = d.Ack(false)
 	}
-	slog.Error("tap consumer stopped")
-	os.Exit(1)
+	if ctx.Err() == nil {
+		lifecycle.Fatal("responses consumer stopped", errors.New("delivery channel closed"))
+	}
+}
+
+func (a *api) consumePrivate(ctx context.Context, deliveries <-chan amqp.Delivery) {
+	for d := range deliveries {
+		a.complete(d.ReplyTo, d.CorrelationId, d.Body)
+	}
+	if ctx.Err() == nil {
+		lifecycle.Fatal("reply consumer stopped", errors.New("delivery channel closed"))
+	}
 }
 
 // ---- HTTP handlers --------------------------------------------------------------
@@ -144,16 +222,25 @@ func (a *api) list(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		limit = 100
 	}
-	writeJSON(w, http.StatusOK, a.registry.List(max(0, limit)))
+	views, err := a.registry.List(r.Context(), max(0, limit))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 
 func (a *api) get(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if v, ok := a.registry.Get(id); ok {
+	v, ok, err := a.registry.Get(r.Context(), id)
+	switch {
+	case err != nil:
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case !ok:
+		writeError(w, http.StatusNotFound, "unknown charge point "+id)
+	default:
 		writeJSON(w, http.StatusOK, v)
-		return
 	}
-	writeError(w, http.StatusNotFound, "unknown charge point "+id)
 }
 
 // commandBody is the union of all command request fields.
@@ -255,19 +342,22 @@ func (a *api) send(w http.ResponseWriter, ctx context.Context, id string, b comm
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("ocppVersion must be one of %v", versions))
 		return
 	case version == "":
-		v, online, known := a.registry.Version(id)
-		if !known {
+		v, online, known, err := a.registry.Lookup(ctx, id)
+		switch {
+		case err != nil:
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		case !known:
 			writeError(w, http.StatusNotFound, "unknown charge point "+id+" (pass ocppVersion to force)")
 			return
-		}
-		if !online {
+		case !online:
 			writeError(w, http.StatusConflict, "charge point "+id+" is offline")
 			return
 		}
 		version = v
 	}
 	payload := build(ocpp.IsV2(version))
-	messageID := uuid.NewString()
+	messageID := a.newMessageID()
 	result := map[string]any{"chargerId": id, "action": action, "ocppVersion": version,
 		"request": payload, "messageId": messageID}
 

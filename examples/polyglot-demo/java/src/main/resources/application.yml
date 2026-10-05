@@ -1,9 +1,13 @@
 server:
   port: ${HTTP_PORT:8080}
+  # On SIGTERM: stop accepting requests, finish the ones in flight.
+  shutdown: graceful
 
 spring:
   application:
     name: csms-java
+  lifecycle:
+    timeout-per-shutdown-phase: ${SHUTDOWN_TIMEOUT_MS:25000}ms
   # Tomcat, listener containers and @Scheduled tasks run on virtual threads,
   # so the command API can simply block while waiting for a charger's answer.
   threads:
@@ -23,12 +27,40 @@ spring:
         prefetch: ${PREFETCH:200}
         concurrency: ${WORKER_CONCURRENCY:8}
         acknowledge-mode: auto
-        default-requeue-rejected: false
+        default-requeue-rejected: true
+  data:
+    redis:
+      host: ${VALKEY_HOST:localhost}
+      port: ${VALKEY_PORT:6379}
+
+# Probes for the orchestrator: GET /healthz/live and GET /healthz/ready.
+# Readiness turns DOWN as soon as a shutdown starts, and while RabbitMQ or
+# Valkey are unreachable.
+management:
+  endpoints:
+    web:
+      base-path: /
+      path-mapping:
+        health: healthz
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        live:
+          include: livenessState
+        ready:
+          include: readinessState,rabbit,redis
 
 csms:
   implementation: java
+  # Parts of the CSMS this process runs: any of worker, api, dashboard.
+  roles: ${CSMS_ROLES:worker,api,dashboard}
   heartbeat-interval: ${HEARTBEAT_INTERVAL:60}
   command-timeout: ${COMMAND_TIMEOUT_MS:15000}ms
+  command-api-url: ${COMMAND_API_URL:http://localhost:8081}
   management-url: ${RABBITMQ_MANAGEMENT_URL:http://localhost:15672}
   management-user: ${RABBITMQ_USER:csms}
   management-password: ${RABBITMQ_PASS:csms}

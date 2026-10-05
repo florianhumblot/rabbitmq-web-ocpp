@@ -49,3 +49,7 @@ func (r RabbitMQ) URI() string {
 	return fmt.Sprintf("amqp://%s:%s@%s:%d/%s", url.QueryEscape(r.User), url.QueryEscape(r.Password),
 		r.Host, r.Port, url.PathEscape(r.Vhost))
 }
+
+// ShutdownTimeout bounds the graceful drain on SIGTERM; keep it below the
+// orchestrator's termination grace period.
+func ShutdownTimeout() time.Duration { return Millis("SHUTDOWN_TIMEOUT_MS", 25000) }

@@ -2,9 +2,12 @@
 #
 #   docker compose --profile java up -d --build      # or rust, or go (or all three)
 #   TARGET=java docker compose run --rm gatling      # 10k chargers against that CSMS
+#   docker compose up -d --scale csms-java-worker=4  # scale a role
 #
 # Each implementation owns a vhost (csms-java, csms-rust, csms-go), so all
-# three can run side by side on one broker. See README.md.
+# three can run side by side on one broker. Every CSMS process is stateless:
+# shared state lives in RabbitMQ and Valkey, so each role scales out by adding
+# replicas. See README.md, and k8s/ for rolling deployments and autoscaling.
 name: ocpp-polyglot
 
 x-csms-env: &csms-env
@@ -18,12 +21,29 @@ x-csms-env: &csms-env
   PREFETCH: "200"
   WORKER_CONCURRENCY: "8"
   COMMAND_TIMEOUT_MS: "15000"
+  VALKEY_HOST: valkey
 
 x-csms: &csms
   depends_on:
     rabbitmq:
       condition: service_healthy
+    valkey:
+      condition: service_healthy
   restart: unless-stopped
+  # SIGTERM starts a graceful drain; give it time before SIGKILL.
+  stop_grace_period: 30s
+
+x-java-image: &java-image
+  build:
+    context: .
+    dockerfile: java/Dockerfile
+  image: ocpp-polyglot/csms-java:local
+
+x-rust-image: &rust-image
+  build:
+    context: .
+    dockerfile: rust/Dockerfile
+  image: ocpp-polyglot/csms-rust:local
 
 x-go-image: &go-image
   build:
@@ -36,6 +56,7 @@ services:
   # Re-running with unchanged parameters is a no-op.
   provision:
     build: ./provision
+    image: ocpp-polyglot/provision:local
     environment:
       CHARGERS: ${CHARGERS:-10000}
       OCPP21_PCT: ${OCPP21_PCT:-50}
@@ -72,31 +93,61 @@ services:
       retries: 30
       start_period: 20s
 
+  # Shared charger registry (see valkey/registry.lua).
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- Java: Spring Boot modular monolith -----------------------------------
+  # One artifact; CSMS_ROLES picks what a process runs (default: everything).
+  # Entry point: command API + dashboard.
   csms-java:
-    <<: *csms
+    <<: [*csms, *java-image]
     profiles: [java]
-    build:
-      context: .
-      dockerfile: java/Dockerfile
     environment:
       <<: *csms-env
       RABBITMQ_VHOST: csms-java
+      CSMS_ROLES: api,dashboard
     ports:
       - "8081:8080"
 
+  csms-java-worker:
+    <<: [*csms, *java-image]
+    profiles: [java]
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-java
+      CSMS_ROLES: worker
+    deploy:
+      replicas: 2
+
   # ---- Rust: single tokio binary --------------------------------------------
+  # One binary; CSMS_ROLES picks what a process runs (default: everything).
   csms-rust:
-    <<: *csms
+    <<: [*csms, *rust-image]
     profiles: [rust]
-    build:
-      context: .
-      dockerfile: rust/Dockerfile
     environment:
       <<: *csms-env
       RABBITMQ_VHOST: csms-rust
+      CSMS_ROLES: api,dashboard
     ports:
       - "8082:8080"
+
+  csms-rust-worker:
+    <<: [*csms, *rust-image]
+    profiles: [rust]
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-rust
+      CSMS_ROLES: worker
+    deploy:
+      replicas: 2
 
   # ---- Go: three microservices from one image --------------------------------
   # Entry point: dashboard, proxying /api/ to the command API.
@@ -118,6 +169,8 @@ services:
     environment:
       <<: *csms-env
       RABBITMQ_VHOST: csms-go
+    deploy:
+      replicas: 2
 
   csms-go-worker:
     <<: [*csms, *go-image]
@@ -137,6 +190,7 @@ services:
   gatling:
     profiles: [gatling]
     build: ./gatling
+    image: ocpp-polyglot/gatling:local
     depends_on:
       rabbitmq:
         condition: service_healthy

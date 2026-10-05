@@ -1,12 +1,10 @@
-// Package monitor turns tapped OCPP traffic into a charger registry and
-// traffic statistics. It is shared by the command-api (registry only) and the
-// dashboard (both) services.
+// Package monitor turns the dashboard's tap on all OCPP traffic into traffic
+// statistics: message rates, CSMS reply latency and command outcomes. The
+// charger registry is shared state in Valkey, see package registry.
 package monitor
 
 import (
 	"slices"
-	"sort"
-	"strconv"
 	"sync"
 	"time"
 
@@ -50,162 +48,6 @@ func Classify(d amqp.Delivery) (Event, bool) {
 func (e Event) Payload() map[string]any { return e.Frame.Object(3) }
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
-
-// ---- Registry ---------------------------------------------------------------
-
-type charger struct {
-	version         string
-	online          bool
-	lastSeen        int64
-	securityProfile string
-	connectors      map[string]string
-}
-
-// ChargerView is the JSON shape of a charger in the API.
-type ChargerView struct {
-	ID              string            `json:"id"`
-	OcppVersion     string            `json:"ocppVersion"`
-	SecurityProfile *string           `json:"securityProfile"`
-	Online          bool              `json:"online"`
-	LastSeen        int64             `json:"lastSeen"`
-	Connectors      map[string]string `json:"connectors"`
-}
-
-type ChargerSummary struct {
-	Known             int            `json:"known"`
-	Online            int            `json:"online"`
-	ByVersion         map[string]int `json:"byVersion"`
-	BySecurityProfile map[string]int `json:"bySecurityProfile"`
-}
-
-// Registry is what the CSMS knows about every charge point, learned purely
-// from the OCPP traffic seen on the broker.
-type Registry struct {
-	mu       sync.RWMutex
-	chargers map[string]*charger
-}
-
-func NewRegistry() *Registry { return &Registry{chargers: map[string]*charger{}} }
-
-// Apply updates the registry with a frame sent by a charger.
-func (r *Registry) Apply(ev Event) {
-	if !ev.FromCharger {
-		return
-	}
-	var payload map[string]any
-	if ev.Key.Direction == "req" {
-		payload = ev.Payload()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	c := r.chargers[ev.ChargerID]
-	if c == nil {
-		c = &charger{securityProfile: ocpp.SecurityProfile(ev.ChargerID), connectors: map[string]string{}}
-		r.chargers[ev.ChargerID] = c
-	}
-	c.version, c.lastSeen = ev.Key.Version, nowMillis()
-	if ev.Key.Direction != "req" {
-		// A CALLRESULT/CALLERROR from the charger proves it is connected.
-		c.online = true
-		return
-	}
-	if ocpp.IsSyntheticOffline(ev.Key.Action, payload) {
-		c.online = false
-		return
-	}
-	c.online = true
-	if ev.Key.Action == "StatusNotification" {
-		// 1.6: connectorId + status. 2.x: evseId + connectorStatus (one connector per EVSE).
-		connectorKey, statusKey := "connectorId", "status"
-		if ocpp.IsV2(ev.Key.Version) {
-			connectorKey, statusKey = "evseId", "connectorStatus"
-		}
-		connector, _ := payload[connectorKey].(float64)
-		status, _ := payload[statusKey].(string)
-		if connector > 0 && status != "" {
-			c.connectors[strconv.Itoa(int(connector))] = status
-		}
-	}
-}
-
-// Version returns the charger's protocol and whether it is online.
-func (r *Registry) Version(id string) (version string, online, known bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	c := r.chargers[id]
-	if c == nil {
-		return "", false, false
-	}
-	return c.version, c.online, true
-}
-
-func view(id string, c *charger) ChargerView {
-	v := ChargerView{ID: id, OcppVersion: c.version, Online: c.online, LastSeen: c.lastSeen,
-		Connectors: make(map[string]string, len(c.connectors))}
-	if c.securityProfile != "" {
-		sp := c.securityProfile
-		v.SecurityProfile = &sp
-	}
-	for k, s := range c.connectors {
-		v.Connectors[k] = s
-	}
-	return v
-}
-
-func (r *Registry) Get(id string) (ChargerView, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	c := r.chargers[id]
-	if c == nil {
-		return ChargerView{}, false
-	}
-	return view(id, c), true
-}
-
-// List returns online chargers first, then by id.
-func (r *Registry) List(limit int) []ChargerView {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	ids := make([]string, 0, len(r.chargers))
-	for id := range r.chargers {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		a, b := r.chargers[ids[i]], r.chargers[ids[j]]
-		if a.online != b.online {
-			return a.online
-		}
-		return ids[i] < ids[j]
-	})
-	out := make([]ChargerView, 0, min(limit, len(ids)))
-	for _, id := range ids[:min(limit, len(ids))] {
-		out = append(out, view(id, r.chargers[id]))
-	}
-	return out
-}
-
-// Summary counts online chargers by version and security profile, and their
-// connectors by status.
-func (r *Registry) Summary() (ChargerSummary, map[string]int) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	s := ChargerSummary{Known: len(r.chargers), ByVersion: map[string]int{}, BySecurityProfile: map[string]int{}}
-	connectors := map[string]int{}
-	for _, c := range r.chargers {
-		if !c.online {
-			continue
-		}
-		s.Online++
-		s.ByVersion[c.version]++
-		if c.securityProfile != "" {
-			s.BySecurityProfile[c.securityProfile]++
-		}
-		for _, status := range c.connectors {
-			connectors[status]++
-		}
-	}
-	return s, connectors
-}
 
 // ---- Stats --------------------------------------------------------------------
 

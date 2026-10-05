@@ -1,12 +1,15 @@
 //! Version-neutral command API. A request is translated to the OCPP 1.6 or 2.x
-//! payload based on the protocol the charger connected with (learned from its
-//! traffic), or on an explicit `ocppVersion` field in the body.
+//! payload based on the protocol recorded in the shared registry, or on an
+//! explicit `ocppVersion` field in the body.
 //!
 //! The CALL is published to `amq.topic` with the charge point id as routing
-//! key; the plugin queues it in the charger's own queue. The answer comes back
-//! as `<protocol>.response.conf|error` and is handed over by the tap. Every
-//! instance taps all answers, so only the one holding the pending call
-//! completes it.
+//! key; the plugin queues it in the charger's own queue. Any number of
+//! instances can run behind a load balancer: the charger's answer
+//! (`<protocol>.response.conf|error`) lands in the shared `csms.responses`
+//! queue and may be consumed by any instance. The OCPP message id starts with
+//! the id of the instance that sent the command, so an instance receiving
+//! somebody else's answer forwards it to that instance's private queue: at
+//! most one extra hop, and no instance sees all answers.
 
 use crate::{App, amqp, ocpp};
 use axum::{
@@ -16,10 +19,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use lapin::{
+    options::{BasicAckOptions, BasicNackOptions, BasicQosOptions, QueueDeclareOptions},
+    types::FieldTable,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::oneshot;
+use tracing::error;
 
 const VERSIONS: [&str; 3] = ["ocpp16", "ocpp201", "ocpp21"];
 const TRIGGERABLE: [&str; 4] = [
@@ -28,6 +38,127 @@ const TRIGGERABLE: [&str; 4] = [
     "MeterValues",
     "StatusNotification",
 ];
+
+const REPLY_QUEUE_PREFIX: &str = "csms.replies.";
+
+type Key = (String, String);
+
+/// Commands waiting for the charger's answer, by (charge point id, message id).
+#[derive(Default)]
+pub struct Pending(Mutex<HashMap<Key, oneshot::Sender<Value>>>);
+
+impl Pending {
+    fn complete(&self, delivery: &lapin::message::Delivery) {
+        let (Some(charger), Some(message_id)) = (
+            delivery.properties.reply_to(),
+            delivery.properties.correlation_id(),
+        ) else {
+            return;
+        };
+        let key = (charger.to_string(), message_id.to_string());
+        let waiter = self.0.lock().unwrap().remove(&key);
+        if let (Some(waiter), Ok(frame)) = (waiter, serde_json::from_slice(&delivery.data)) {
+            let _ = waiter.send(frame);
+        }
+    }
+}
+
+/// "<instance>-<random>": 36 characters, the maximum length of an OCPP
+/// message id.
+fn new_message_id(instance: &str) -> String {
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    format!("{instance}-{}", &random[..27])
+}
+
+/// The instance id at the start of a message id made by `new_message_id`.
+fn owner_of(message_id: &str) -> Option<&str> {
+    (message_id.len() == 36 && message_id.as_bytes()[8] == b'-').then(|| &message_id[..8])
+}
+
+/// Consumes the shared queue of answers until shutdown: completes our own
+/// pending commands and forwards the others to their owner's private queue.
+/// If that instance is gone, the forward is unroutable and dropped, like its
+/// HTTP request.
+pub async fn run_responses(app: Arc<App>) -> lapin::Result<()> {
+    let channel = app.conn.create_channel().await?;
+    amqp::declare_responses_queue(&channel).await?;
+    channel.basic_qos(200, BasicQosOptions::default()).await?;
+    let tag = format!("csms-rust-api-{}", app.instance);
+    amqp::consume_until_shutdown(
+        &app,
+        &channel,
+        amqp::RESPONSES_QUEUE,
+        &tag,
+        false,
+        |delivery| {
+            let (app, channel) = (app.clone(), channel.clone());
+            async move {
+                let message_id = delivery
+                    .properties
+                    .correlation_id()
+                    .as_ref()
+                    .map(|s| s.to_string());
+                match message_id.as_deref().and_then(owner_of) {
+                    Some(owner) if owner == app.instance => app.pending.complete(&delivery),
+                    Some(owner) => {
+                        let properties = delivery.properties.clone();
+                        let queue = format!("{REPLY_QUEUE_PREFIX}{owner}");
+                        if let Err(e) =
+                            amqp::publish_to(&channel, "", &queue, &delivery.data, properties).await
+                        {
+                            error!("forward to {owner} failed: {e}");
+                            return delivery
+                                .nack(BasicNackOptions {
+                                    requeue: true,
+                                    ..Default::default()
+                                })
+                                .await
+                                .map(drop);
+                        }
+                    }
+                    None => {}
+                }
+                delivery.ack(BasicAckOptions::default()).await.map(drop)
+            }
+        },
+    )
+    .await
+}
+
+/// Consumes this instance's private queue of forwarded answers. It runs until
+/// the process exits, so commands in flight during a shutdown still complete.
+pub async fn run_replies(app: Arc<App>) -> lapin::Result<()> {
+    use futures_util::StreamExt;
+    let channel = app.conn.create_channel().await?;
+    let queue = format!("{REPLY_QUEUE_PREFIX}{}", app.instance);
+    channel
+        .queue_declare(
+            queue.as_str().into(),
+            QueueDeclareOptions {
+                exclusive: true,
+                auto_delete: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    let mut consumer = channel
+        .basic_consume(
+            queue.as_str().into(),
+            "".into(),
+            lapin::options::BasicConsumeOptions {
+                no_ack: true,
+                exclusive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await?;
+    while let Some(delivery) = consumer.next().await {
+        app.pending.complete(&delivery?);
+    }
+    Ok(())
+}
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
@@ -39,19 +170,17 @@ pub struct ListParams {
 }
 
 pub async fn list(State(app): State<Arc<App>>, Query(params): Query<ListParams>) -> Response {
-    Json(
-        app.registry
-            .lock()
-            .unwrap()
-            .list(params.limit.unwrap_or(100)),
-    )
-    .into_response()
+    match app.registry.list(params.limit.unwrap_or(100)).await {
+        Ok(views) => Json(views).into_response(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
 }
 
 pub async fn get(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
-    match app.registry.lock().unwrap().view_of(&id) {
-        Some(view) => Json(view).into_response(),
-        None => error(StatusCode::NOT_FOUND, format!("unknown charge point {id}")),
+    match app.registry.get(&id).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, format!("unknown charge point {id}")),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     }
 }
 
@@ -179,31 +308,32 @@ async fn send(
                 format!("ocppVersion must be one of {VERSIONS:?}"),
             );
         }
-        None => match app.registry.lock().unwrap().get(&id) {
-            None => {
+        None => match app.registry.lookup(&id).await {
+            Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+            Ok(None) => {
                 return error(
                     StatusCode::NOT_FOUND,
                     format!("unknown charge point {id} (pass ocppVersion to force)"),
                 );
             }
-            Some(c) if !c.online => {
+            Ok(Some((_, false))) => {
                 return error(
                     StatusCode::CONFLICT,
                     format!("charge point {id} is offline"),
                 );
             }
-            Some(c) => c.version.clone(),
+            Ok(Some((version, true))) => version,
         },
     };
     let payload = build(ocpp::is_v2(&version));
-    let message_id = uuid::Uuid::new_v4().to_string();
+    let message_id = new_message_id(&app.instance);
     let mut result = json!({
         "chargerId": id, "action": action, "ocppVersion": version, "request": payload, "messageId": message_id,
     });
 
     let key = (id.clone(), message_id.clone());
     let (tx, rx) = oneshot::channel();
-    app.pending.lock().unwrap().insert(key.clone(), tx);
+    app.pending.0.lock().unwrap().insert(key.clone(), tx);
 
     let frame = json!([ocpp::CALL, message_id, action, payload]);
     let properties = amqp::json_properties()
@@ -219,7 +349,7 @@ async fn send(
     )
     .await
     {
-        app.pending.lock().unwrap().remove(&key);
+        app.pending.0.lock().unwrap().remove(&key);
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("publish failed: {e}"),
@@ -227,7 +357,7 @@ async fn send(
     }
 
     let answer = tokio::time::timeout(app.cfg.command_timeout, rx).await;
-    app.pending.lock().unwrap().remove(&key);
+    app.pending.0.lock().unwrap().remove(&key);
     result["latencyMs"] = json!(start.elapsed().as_millis() as u64);
     match answer {
         Ok(Ok(answer)) if answer[0].as_u64() == Some(ocpp::CALLRESULT) => {
@@ -243,5 +373,18 @@ async fn send(
             result["error"] = json!("no answer from the charge point in time");
             (StatusCode::GATEWAY_TIMEOUT, Json(result)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_ids_carry_their_owner() {
+        let id = new_message_id("0a1b2c3d");
+        assert_eq!(id.len(), 36);
+        assert_eq!(owner_of(&id), Some("0a1b2c3d"));
+        assert_eq!(owner_of("m1"), None);
     }
 }

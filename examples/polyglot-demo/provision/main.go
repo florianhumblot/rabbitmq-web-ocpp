@@ -39,7 +39,12 @@ import (
 	"time"
 )
 
+// schema changes whenever the generated output changes for the same
+// parameters, so that existing ./generated directories are refreshed.
+const schema = 3
+
 type params struct {
+	Schema     int      `json:"schema"`
 	Chargers   int      `json:"chargers"`
 	Ocpp21Pct  int      `json:"ocpp21Pct"`
 	SP1Pct     int      `json:"sp1Pct"`
@@ -60,7 +65,7 @@ type charger struct {
 }
 
 func main() {
-	var p params
+	p := params{Schema: schema}
 	var vhosts, sans string
 	out := flag.String("out", envOr("OUT_DIR", "generated"), "output directory")
 	force := flag.Bool("force", false, "regenerate even if parameters are unchanged")
@@ -183,11 +188,24 @@ func writeDefinitions(path string, p params, fleet []charger) error {
 	for _, vh := range p.Vhosts {
 		vhosts = append(vhosts, m{"name": vh})
 		perms = append(perms, m{"user": p.CsmsUser, "vhost": vh, "configure": ".*", "write": ".*", "read": ".*"})
-		queues = append(queues, m{"name": "csms.requests", "vhost": vh, "durable": true, "auto_delete": false, "arguments": m{}})
-		bindings = append(bindings, m{
-			"source": "amq.topic", "vhost": vh, "destination": "csms.requests",
-			"destination_type": "queue", "routing_key": "*.*.req", "arguments": m{},
-		})
+		// Shared work queues, consumed by any number of CSMS instances. Every
+		// implementation declares them identically on startup. They are
+		// durable classic queues: the plugin publishes into them directly, and
+		// it does not yet keep the client state quorum queues need.
+		for _, q := range []string{"csms.requests", "csms.responses"} {
+			queues = append(queues, m{"name": q, "vhost": vh, "durable": true, "auto_delete": false,
+				"arguments": m{}})
+		}
+		for _, b := range [][2]string{
+			{"csms.requests", "*.*.req"},          // charger-initiated CALLs, for the workers
+			{"csms.responses", "*.response.conf"}, // charger answers to CSMS commands, for the APIs
+			{"csms.responses", "*.response.error"},
+		} {
+			bindings = append(bindings, m{
+				"source": "amq.topic", "vhost": vh, "destination": b[0],
+				"destination_type": "queue", "routing_key": b[1], "arguments": m{},
+			})
+		}
 	}
 	for _, c := range fleet {
 		u := m{"name": c.ID, "hashing_algorithm": "rabbit_password_hashing_sha256", "password_hash": "", "tags": []string{}}

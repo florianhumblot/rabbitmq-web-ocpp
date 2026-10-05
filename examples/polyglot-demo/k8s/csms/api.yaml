@@ -1,0 +1,111 @@
+# Command API. Stateless: any replica serves any request; the charger's
+# answer reaches the right replica through csms.responses and the replica's
+# private reply queue.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: csms-api
+  labels:
+    app.kubernetes.io/name: csms
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  # Rolling deployments: start a new pod, wait until it is ready, then stop
+  # an old one. Never fewer ready pods than desired.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: csms
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: csms
+        app.kubernetes.io/component: api
+    spec:
+      # SIGTERM starts the drain (stop consuming, finish in-flight work).
+      terminationGracePeriodSeconds: 40
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: csms
+              app.kubernetes.io/component: api
+      containers:
+        - name: csms
+          image: csms
+          env:
+            - name: CSMS_ROLES
+              value: api
+          envFrom:
+            - configMapRef:
+                name: csms-config
+            - secretRef:
+                name: csms-rabbitmq
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # Fails as soon as the process starts draining, and while
+            # RabbitMQ or Valkey are unreachable.
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            # Let endpoints and load balancers stop routing here before the
+            # process receives SIGTERM.
+            preStop:
+              sleep:
+                seconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: csms-api
+spec:
+  selector:
+    app.kubernetes.io/name: csms
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: csms-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: csms
+      app.kubernetes.io/component: api
