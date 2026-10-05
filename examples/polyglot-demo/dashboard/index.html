@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCPP CSMS Dashboard</title>
+<!--
+  Shared dashboard for the polyglot demo. Every CSMS implementation (Java,
+  Rust, Go) serves this same file at / and pushes a JSON snapshot once per
+  second on the /ws WebSocket. Commands go to the /api endpoints. See
+  ../README.md, section "Implementation contract", for the formats.
+-->
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --critical: #d03b3b;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--surface);
+}
+header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+.impl { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+  border: 1px solid var(--border); border-radius: 999px; color: var(--text-secondary); font-size: 12px;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--critical); }
+.dot.ok { background: var(--good); }
+header .spacer { flex: 1; }
+main { padding: 16px; display: grid; gap: 16px; max-width: 1500px; margin: 0 auto; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0;
+}
+.tile .label { color: var(--text-secondary); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; white-space: nowrap; }
+.tile .sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+@media (max-width: 520px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+h2 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-secondary); font-size: 12px; margin-bottom: 4px; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 6px; border-radius: 1px; }
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; height: 200px; overflow: visible; }
+.chart .tip {
+  position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  display: none; white-space: nowrap; z-index: 2;
+}
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip i { width: 10px; height: 2px; display: inline-block; }
+.bars { display: grid; gap: 8px; }
+.bar-row { display: grid; grid-template-columns: 110px 1fr 64px; gap: 8px; align-items: center; font-size: 13px; }
+.bar-row .name { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .track { height: 10px; position: relative; }
+.bar-row .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--series-1); border-radius: 0 4px 4px 0; min-width: 2px; }
+.bar-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--text-muted); font-weight: 500; font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--grid); }
+td { padding: 4px 6px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+td.r, th.r { text-align: right; }
+.scroll { max-height: 290px; overflow: auto; }
+.log { font-family: var(--mono); font-size: 12px; }
+.log td { white-space: nowrap; }
+.dir-in { color: var(--text-secondary); }
+form { display: grid; gap: 8px; }
+.form-row { display: flex; gap: 8px; flex-wrap: wrap; }
+input, select, button {
+  font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--page); color: var(--text-primary); min-width: 0;
+}
+input { flex: 1 1 200px; }
+button { cursor: pointer; background: var(--series-1); color: #fff; border: 0; font-weight: 600; }
+button.ghost { background: transparent; color: var(--text-secondary); border: 1px solid var(--border); font-weight: 400; }
+pre {
+  margin: 0; font-family: var(--mono); font-size: 12px; background: var(--page); padding: 8px;
+  border-radius: 6px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}
+.status-badge { display: inline-flex; align-items: center; gap: 4px; }
+.muted { color: var(--text-muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>OCPP CSMS · <span class="impl" id="impl">…</span></h1>
+  <span class="pill"><span class="dot" id="wsDot"></span><span id="wsState">connecting</span></span>
+  <span class="pill" id="brokerPill"><span class="dot" id="brokerDot"></span>broker</span>
+  <span class="pill muted" id="instance"></span>
+  <span class="spacer"></span>
+  <button class="ghost" id="themeBtn" type="button" aria-label="Toggle theme">Theme</button>
+</header>
+
+<main>
+  <section class="tiles" aria-label="Key figures">
+    <div class="card tile"><div class="label">Chargers online</div><div class="value" id="tOnline">–</div><div class="sub" id="tKnown">of – known</div></div>
+    <div class="card tile"><div class="label">Inbound msg/s (charger → CSMS)</div><div class="value" id="tIn">–</div><div class="sub" id="tInSub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">Outbound msg/s (CSMS → charger)</div><div class="value" id="tOut">–</div><div class="sub">&nbsp;</div></div>
+    <div class="card tile"><div class="label">CSMS reply latency p95</div><div class="value" id="tP95">–</div><div class="sub" id="tLatSub">p50 – · p99 –</div></div>
+    <div class="card tile"><div class="label">csms.requests backlog</div><div class="value" id="tQueue">–</div><div class="sub" id="tQueueSub">– consumers</div></div>
+    <div class="card tile"><div class="label">Broker connections</div><div class="value" id="tConns">–</div><div class="sub" id="tQueues">– queues</div></div>
+    <div class="card tile"><div class="label">Broker memory</div><div class="value" id="tMem">–</div><div class="sub" id="tMemSub">&nbsp;</div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>OCPP messages per second</h2>
+      <div class="legend"><span><i style="background:var(--series-1)"></i>Inbound</span><span><i style="background:var(--series-2)"></i>Outbound</span></div>
+      <div class="chart" id="rateChart"></div>
+    </div>
+    <div class="card">
+      <h2>CSMS reply latency (ms) — charger request seen on the broker → reply seen on the broker</h2>
+      <div class="legend"><span><i style="background:var(--series-1)"></i>p50</span><span><i style="background:var(--series-2)"></i>p95</span><span><i style="background:var(--series-3)"></i>p99</span></div>
+      <div class="chart" id="latChart"></div>
+    </div>
+  </section>
+
+  <section class="grid3">
+    <div class="card"><h2>Online chargers by OCPP version</h2><div class="bars" id="byVersion"></div></div>
+    <div class="card"><h2>Online chargers by security profile</h2><div class="bars" id="byProfile"></div></div>
+    <div class="card"><h2>Connector status (online chargers)</h2><div class="bars" id="byStatus"></div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <h2>OCPP calls by action</h2>
+      <div class="scroll"><table><thead><tr><th>Action</th><th>Direction</th><th class="r">msg/s</th></tr></thead><tbody id="actions"></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Commands (CSMS → charger)</h2>
+      <div class="tiles" style="grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:12px">
+        <div><div class="muted">sent</div><div id="cSent" style="font-size:18px;font-weight:600">–</div></div>
+        <div><div class="muted">accepted</div><div id="cAcc" style="font-size:18px;font-weight:600">–</div></div>
+        <div><div class="muted">rejected</div><div id="cRej" style="font-size:18px;font-weight:600">–</div></div>
+        <div><div class="muted">errors</div><div id="cErr" style="font-size:18px;font-weight:600">–</div></div>
+        <div><div class="muted">pending</div><div id="cPend" style="font-size:18px;font-weight:600">–</div></div>
+      </div>
+      <form id="cmdForm">
+        <div class="form-row">
+          <input id="cmdCharger" list="chargerList" placeholder="charge point id, e.g. cp00001-v16-sp1" required autocomplete="off">
+          <datalist id="chargerList"></datalist>
+          <select id="cmdAction">
+            <option value="trigger-message">TriggerMessage</option>
+            <option value="change-availability">ChangeAvailability</option>
+            <option value="reset">Reset</option>
+          </select>
+        </div>
+        <div class="form-row" id="cmdParams"></div>
+        <div class="form-row"><button type="submit">Send command</button><span class="muted" id="cmdHint"></span></div>
+      </form>
+      <pre id="cmdResult" style="margin-top:8px">No command sent yet.</pre>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Live traffic sample (latest frames seen on the broker)</h2>
+    <div class="scroll"><table class="log"><thead><tr><th>time</th><th>dir</th><th>charge point</th><th>type</th><th>action</th><th>message id</th></tr></thead><tbody id="recent"></tbody></table></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const HISTORY = 300; // seconds kept in the line charts
+const history = { t: [], in: [], out: [], p50: [], p95: [], p99: [] };
+const $ = (id) => document.getElementById(id);
+const fmt = (n, d = 0) => n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const fmtBytes = (b) => b == null ? "–" : b >= 1 << 30 ? fmt(b / (1 << 30), 2) + " GiB" : fmt(b / (1 << 20), 0) + " MiB";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// Theme toggle: the viewer's choice beats the OS preference in both directions.
+try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (_) {}
+$("themeBtn").onclick = () => {
+  const dark = getComputedStyle(document.documentElement).colorScheme.includes("dark");
+  const next = dark ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("theme", next); } catch (_) {}
+  redraw();
+};
+
+// ---- Line chart with crosshair + tooltip (one y axis, shared unit) --------
+function lineChart(el, seriesDefs, unit) {
+  el.innerHTML = '<svg role="img"></svg><div class="tip"></div>';
+  const svg = el.querySelector("svg"), tip = el.querySelector(".tip");
+  let hoverIdx = null;
+  function draw() {
+    const W = el.clientWidth || 600, H = 200, L = 46, R = 44, T = 8, B = 22;
+    const xs = history.t, n = xs.length;
+    let max = 0;
+    for (const s of seriesDefs) for (const v of history[s.key]) if (v != null && v > max) max = v;
+    const step = niceStep((max || 1) / 4);
+    max = step * 4;
+    // Points are right-aligned: the newest sample always sits at "now".
+    const x = (i) => L + ((HISTORY - n + i) / (HISTORY - 1)) * (W - L - R);
+    const y = (v) => T + (1 - v / max) * (H - T - B);
+    let out = "";
+    for (let k = 0; k <= 4; k++) {
+      const v = step * k, yy = y(v);
+      out += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="var(--${k === 0 ? "axis" : "grid"})" stroke-width="1"/>`;
+      out += `<text x="${L - 6}" y="${yy + 4}" text-anchor="end" font-size="11" fill="var(--text-muted)" style="font-variant-numeric:tabular-nums">${fmt(v, Number.isInteger(step) ? 0 : 1)}</text>`;
+    }
+    out += `<text x="${L}" y="${H - 4}" font-size="11" fill="var(--text-muted)">-${HISTORY / 60} min</text>`;
+    out += `<text x="${W - R}" y="${H - 4}" font-size="11" text-anchor="end" fill="var(--text-muted)">now</text>`;
+    const labels = [];
+    for (const s of seriesDefs) {
+      let d = "", pen = false;
+      history[s.key].forEach((v, i) => {
+        if (v == null) { pen = false; return; }
+        d += (pen ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1); pen = true;
+      });
+      out += `<path d="${d}" fill="none" stroke="var(${s.color})" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      const last = history[s.key][n - 1];
+      if (last != null) labels.push({ y: y(last) + 4, text: s.label });
+    }
+    // Direct labels at the line ends, pushed apart when the lines meet.
+    labels.sort((a, b) => a.y - b.y);
+    for (let i = 1; i < labels.length; i++) labels[i].y = Math.max(labels[i].y, labels[i - 1].y + 12);
+    for (let i = labels.length - 1; i >= 0; i--) {
+      labels[i].y = Math.min(labels[i].y, i === labels.length - 1 ? H - B + 4 : labels[i + 1].y - 12);
+    }
+    for (const l of labels) out += `<text x="${W - R + 6}" y="${l.y}" font-size="11" fill="var(--text-secondary)">${l.text}</text>`;
+    if (hoverIdx != null && hoverIdx < n) {
+      const hx = x(hoverIdx);
+      out += `<line x1="${hx}" x2="${hx}" y1="${T}" y2="${H - B}" stroke="var(--axis)" stroke-width="1"/>`;
+      for (const s of seriesDefs) {
+        const v = history[s.key][hoverIdx];
+        if (v != null) out += `<circle cx="${hx}" cy="${y(v)}" r="4" fill="var(${s.color})" stroke="var(--surface)" stroke-width="2"/>`;
+      }
+    }
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("aria-label", seriesDefs.map((s) => `${s.label} ${fmt(history[s.key][n - 1], 1)} ${unit}`).join(", "));
+    svg.innerHTML = out;
+    return { x, W, L, R, n };
+  }
+  let geom = null;
+  svg.addEventListener("mousemove", (e) => {
+    if (!geom) return;
+    const rect = svg.getBoundingClientRect();
+    const px = (e.clientX - rect.left) * (geom.W / rect.width);
+    let best = null, bd = Infinity;
+    for (let i = 0; i < geom.n; i++) { const d = Math.abs(geom.x(i) - px); if (d < bd) { bd = d; best = i; } }
+    hoverIdx = best;
+    if (best == null) return;
+    const ago = Math.round((Date.now() - history.t[best]) / 1000);
+    tip.innerHTML = `<div class="muted">${ago}s ago</div>` + seriesDefs.map((s) =>
+      `<div class="row"><i style="background:var(${s.color})"></i>${s.label}<b style="margin-left:auto;padding-left:10px">${fmt(history[s.key][best], 1)} ${unit}</b></div>`).join("");
+    tip.style.display = "block";
+    const left = e.clientX - rect.left + 14;
+    tip.style.left = Math.min(left, rect.width - tip.offsetWidth - 4) + "px";
+    tip.style.top = "8px";
+    geom = draw();
+  });
+  svg.addEventListener("mouseleave", () => { hoverIdx = null; tip.style.display = "none"; geom = draw(); });
+  return { draw: () => { geom = draw(); } };
+}
+
+// Smallest "nice" gridline step (1, 2, 2.5, 5 x 10^n) covering v.
+function niceStep(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (v <= m * p) return m * p;
+  return 10 * p;
+}
+
+function bars(el, entries) {
+  const max = Math.max(1, ...entries.map((e) => e[1]));
+  const total = entries.reduce((a, e) => a + e[1], 0);
+  el.innerHTML = entries.length === 0 ? '<div class="muted">no data yet</div>' : entries.map(([k, v]) => {
+    const pct = total ? Math.round((v / total) * 100) : 0;
+    return `<div class="bar-row" title="${esc(k)}: ${fmt(v)} (${pct}%)"><span class="name">${esc(k)}</span>` +
+      `<span class="track"><span class="fill" style="width:${(v / max) * 100}%"></span></span>` +
+      `<span class="num">${fmt(v)}</span></div>`;
+  }).join("");
+}
+
+const rateChart = lineChart($("rateChart"), [
+  { key: "in", label: "Inbound", color: "--series-1" },
+  { key: "out", label: "Outbound", color: "--series-2" },
+], "msg/s");
+const latChart = lineChart($("latChart"), [
+  { key: "p50", label: "p50", color: "--series-1" },
+  { key: "p95", label: "p95", color: "--series-2" },
+  { key: "p99", label: "p99", color: "--series-3" },
+], "ms");
+function redraw() { rateChart.draw(); latChart.draw(); }
+window.addEventListener("resize", redraw);
+
+function push(key, v) { history[key].push(v); if (history[key].length > HISTORY) history[key].shift(); }
+
+function render(s) {
+  $("impl").textContent = s.implementation || "?";
+  document.title = `OCPP CSMS · ${s.implementation || "?"}`;
+  $("instance").textContent = `${s.instance || ""} · up ${fmt(s.uptimeSeconds)}s`;
+  const c = s.chargers || {}, t = s.traffic || {}, l = s.latency || {}, b = s.broker || {}, q = b.requestQueue || {};
+  $("tOnline").textContent = fmt(c.online);
+  $("tKnown").textContent = `of ${fmt(c.known)} known`;
+  $("tIn").textContent = fmt(t.inPerSec);
+  $("tOut").textContent = fmt(t.outPerSec);
+  $("tP95").textContent = l.samples ? fmt(l.p95, 1) + " ms" : "–";
+  $("tLatSub").textContent = l.samples ? `p50 ${fmt(l.p50, 1)} · p99 ${fmt(l.p99, 1)} · max ${fmt(l.max, 0)} ms (${fmt(l.samples)} samples)` : "no replies in the last second";
+  $("tQueue").textContent = fmt(q.messages);
+  $("tQueueSub").textContent = `${fmt(q.consumers)} consumers · ack ${fmt(q.ackRate)}/s`;
+  $("tConns").textContent = fmt(b.connections);
+  $("tQueues").textContent = `${fmt(b.queues)} queues · publish ${fmt(b.publishRate)}/s`;
+  $("tMem").textContent = fmtBytes(b.memoryBytes);
+  $("tMemSub").textContent = b.memoryLimitBytes ? `limit ${fmtBytes(b.memoryLimitBytes)} · ${fmt(b.erlangProcesses)} Erlang processes` : "";
+  $("brokerDot").className = "dot" + (b.available ? " ok" : "");
+  $("brokerPill").title = b.available ? "management API reachable" : "management API unreachable";
+
+  history.t.push(s.timestamp || Date.now()); if (history.t.length > HISTORY) history.t.shift();
+  push("in", t.inPerSec); push("out", t.outPerSec);
+  push("p50", l.samples ? l.p50 : null); push("p95", l.samples ? l.p95 : null); push("p99", l.samples ? l.p99 : null);
+  redraw();
+
+  bars($("byVersion"), Object.entries(c.byVersion || {}).sort());
+  bars($("byProfile"), Object.entries(c.bySecurityProfile || {}).sort().map(([k, v]) => ["SP" + k, v]));
+  bars($("byStatus"), Object.entries(s.connectors || {}).sort((a, b) => b[1] - a[1]));
+
+  const acts = (t.byAction || []).slice().sort((a, b) => b.perSec - a.perSec);
+  $("actions").innerHTML = acts.map((a) => `<tr><td>${esc(a.action)}</td><td class="${a.direction === "in" ? "dir-in" : ""}">${a.direction === "in" ? "charger → CSMS" : "CSMS → charger"}</td><td class="r">${fmt(a.perSec, 1)}</td></tr>`).join("")
+    || '<tr><td colspan="3" class="muted">no traffic</td></tr>';
+
+  const cm = s.commands || {};
+  $("cSent").textContent = fmt(cm.sent); $("cAcc").textContent = fmt(cm.accepted); $("cRej").textContent = fmt(cm.rejected);
+  $("cErr").textContent = fmt(cm.failed); $("cPend").textContent = fmt(cm.pending);
+
+  $("recent").innerHTML = (s.recent || []).map((r) =>
+    `<tr><td>${new Date(r.ts).toISOString().slice(11, 23)}</td><td class="${r.direction === "in" ? "dir-in" : ""}">${r.direction === "in" ? "→ CSMS" : "→ CP"}</td>` +
+    `<td>${esc(r.chargerId)}</td><td>${esc(r.kind)}</td><td>${esc(r.action || "")}</td><td class="muted">${esc(r.messageId)}</td></tr>`).join("");
+}
+
+// ---- Snapshot WebSocket with reconnect -------------------------------------
+function connect() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onopen = () => { $("wsDot").className = "dot ok"; $("wsState").textContent = "live"; };
+  ws.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  ws.onclose = () => { $("wsDot").className = "dot"; $("wsState").textContent = "reconnecting"; setTimeout(connect, 2000); };
+}
+connect();
+
+// ---- Commands ----------------------------------------------------------------
+const params = {
+  "trigger-message": `<select id="pMsg"><option>StatusNotification</option><option>Heartbeat</option><option>BootNotification</option><option>MeterValues</option></select>
+                      <input id="pConn" type="number" min="0" value="1" style="flex:0 0 110px" title="connector / EVSE id">`,
+  "change-availability": `<select id="pType"><option>Inoperative</option><option>Operative</option></select>
+                          <input id="pConn" type="number" min="0" value="0" style="flex:0 0 110px" title="connector / EVSE id (0 = whole station)">`,
+  "reset": `<select id="pType"><option>Soft</option><option>Hard</option></select>`,
+};
+const hints = {
+  "trigger-message": "connector / EVSE id",
+  "change-availability": "0 = whole station",
+  "reset": "mapped to OnIdle / Immediate for OCPP 2.x",
+};
+function updateParams() { const a = $("cmdAction").value; $("cmdParams").innerHTML = params[a]; $("cmdHint").textContent = hints[a]; }
+$("cmdAction").onchange = updateParams; updateParams();
+
+$("cmdForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const action = $("cmdAction").value, id = $("cmdCharger").value.trim();
+  const body = action === "trigger-message" ? { requestedMessage: $("pMsg").value, connectorId: Number($("pConn").value) }
+    : action === "change-availability" ? { type: $("pType").value, connectorId: Number($("pConn").value) }
+    : { type: $("pType").value };
+  $("cmdResult").textContent = `POST /api/chargers/${id}/${action}\n${JSON.stringify(body)}\n…`;
+  try {
+    const res = await fetch(`/api/chargers/${encodeURIComponent(id)}/${action}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let pretty = text; try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    $("cmdResult").textContent = `HTTP ${res.status}\n${pretty}`;
+  } catch (err) { $("cmdResult").textContent = String(err); }
+};
+
+async function loadChargers() {
+  try {
+    const res = await fetch("/api/chargers?limit=500");
+    const list = await res.json();
+    $("chargerList").innerHTML = list.filter((c) => c.online).map((c) => `<option value="${esc(c.id)}">`).join("");
+  } catch (_) {}
+}
+loadChargers(); setInterval(loadChargers, 15000);
+</script>
+</body>
+</html>

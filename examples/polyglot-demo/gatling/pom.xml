@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>demo</groupId>
+  <artifactId>ocpp-load-test</artifactId>
+  <version>1.0.0</version>
+  <description>Gatling simulation of an OCPP 1.6 / 2.1 charger fleet plus a CSMS operator</description>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <gatling.version>3.16.0</gatling.version>
+    <gatling-maven-plugin.version>4.21.12</gatling-maven-plugin.version>
+    <!-- Heap for the load generator: 10k WebSockets need a few GB. -->
+    <gatling.heap>4g</gatling.heap>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.gatling.highcharts</groupId>
+      <artifactId>gatling-charts-highcharts</artifactId>
+      <version>${gatling.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.0</version>
+      </plugin>
+      <plugin>
+        <groupId>io.gatling</groupId>
+        <artifactId>gatling-maven-plugin</artifactId>
+        <version>${gatling-maven-plugin.version}</version>
+        <configuration>
+          <simulationClass>ocpp.ChargePointSimulation</simulationClass>
+          <jvmArgs>
+            <jvmArg>-Xms${gatling.heap}</jvmArg>
+            <jvmArg>-Xmx${gatling.heap}</jvmArg>
+            <jvmArg>-XX:+UseG1GC</jvmArg>
+          </jvmArgs>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,162 @@
+# Polyglot OCPP CSMS demo on rabbitmq-web-ocpp.
+#
+#   docker compose --profile java up -d --build      # or rust, or go (or all three)
+#   TARGET=java docker compose run --rm gatling      # 10k chargers against that CSMS
+#
+# Each implementation owns a vhost (csms-java, csms-rust, csms-go), so all
+# three can run side by side on one broker. See README.md.
+name: ocpp-polyglot
+
+x-csms-env: &csms-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: "5672"
+  RABBITMQ_USER: csms
+  RABBITMQ_PASS: csms
+  RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+  # Interval the CSMS hands out in BootNotification: lower it to raise the load.
+  HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-60}
+  PREFETCH: "200"
+  WORKER_CONCURRENCY: "8"
+  COMMAND_TIMEOUT_MS: "15000"
+
+x-csms: &csms
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+  restart: unless-stopped
+
+x-go-image: &go-image
+  build:
+    context: .
+    dockerfile: go/Dockerfile
+  image: ocpp-polyglot/csms-go:local
+
+services:
+  # Generates the fleet (users, passwords, certificates) into ./generated.
+  # Re-running with unchanged parameters is a no-op.
+  provision:
+    build: ./provision
+    environment:
+      CHARGERS: ${CHARGERS:-10000}
+      OCPP21_PCT: ${OCPP21_PCT:-50}
+      SP1_PCT: ${SP1_PCT:-40}
+      SP2_PCT: ${SP2_PCT:-30}
+      SP3_PCT: ${SP3_PCT:-30}
+    volumes:
+      - ./generated:/out
+
+  rabbitmq:
+    image: ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp
+    hostname: rabbitmq
+    depends_on:
+      provision:
+        condition: service_completed_successfully
+    ports:
+      - "5672:5672"     # AMQP (CSMS backends)
+      - "15672:15672"   # management UI, csms / csms
+      - "19520:19520"   # ws://  Security Profile 1
+      - "19521:19521"   # wss:// Security Profiles 2 and 3
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/conf.d/90-demo.conf:ro
+      - ./generated:/etc/rabbitmq/demo:ro
+      - rabbitmq-data:/var/lib/rabbitmq
+    ulimits:
+      nofile:
+        soft: ${NOFILE:-65536}
+        hard: ${NOFILE:-65536}
+    healthcheck:
+      # check_running only passes once the definitions (10k users) are imported.
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # ---- Java: Spring Boot modular monolith -----------------------------------
+  csms-java:
+    <<: *csms
+    profiles: [java]
+    build:
+      context: .
+      dockerfile: java/Dockerfile
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-java
+    ports:
+      - "8081:8080"
+
+  # ---- Rust: single tokio binary --------------------------------------------
+  csms-rust:
+    <<: *csms
+    profiles: [rust]
+    build:
+      context: .
+      dockerfile: rust/Dockerfile
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-rust
+    ports:
+      - "8082:8080"
+
+  # ---- Go: three microservices from one image --------------------------------
+  # Entry point: dashboard, proxying /api/ to the command API.
+  csms-go:
+    <<: [*csms, *go-image]
+    profiles: [go]
+    command: ["dashboard"]
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-go
+      COMMAND_API_URL: http://csms-go-api:8080
+    ports:
+      - "8083:8080"
+
+  csms-go-api:
+    <<: [*csms, *go-image]
+    profiles: [go]
+    command: ["command-api"]
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-go
+
+  csms-go-worker:
+    <<: [*csms, *go-image]
+    profiles: [go]
+    command: ["ocpp-worker"]
+    environment:
+      <<: *csms-env
+      RABBITMQ_VHOST: csms-go
+      WORKER_CONCURRENCY: "4"
+    deploy:
+      replicas: 2
+
+  # ---- Load generator ---------------------------------------------------------
+  #   TARGET=rust GATLING_CHARGERS=2000 docker compose run --rm gatling
+  # (TARGET is read by compose itself, so it must be set in the shell or .env.)
+  # Reports land in ./gatling/results.
+  gatling:
+    profiles: [gatling]
+    build: ./gatling
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      TARGET_HOST: rabbitmq
+      VHOST: csms-${TARGET:-java}
+      CSMS_API: http://csms-${TARGET:-java}:8080
+      DATA_DIR: /data
+      CHARGERS: ${GATLING_CHARGERS:-0}
+      RAMP_SECONDS: ${RAMP_SECONDS:-120}
+      DURATION_SECONDS: ${DURATION_SECONDS:-600}
+      COMMANDS_PER_SEC: ${COMMANDS_PER_SEC:-2}
+      GATLING_HEAP: ${GATLING_HEAP:-4g}
+    volumes:
+      - ./generated:/data:ro
+      - ./gatling/results:/gatling/target/gatling
+    ulimits:
+      nofile:
+        soft: ${NOFILE:-65536}
+        hard: ${NOFILE:-65536}
+
+volumes:
+  rabbitmq-data:

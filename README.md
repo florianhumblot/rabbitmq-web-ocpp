@@ -73,6 +73,10 @@ The communication flow is straightforward:
 5. Queues can be consumed by multiple identical, stateless workers written in any programming language. Monitor queues using built-in tools (e.g., Grafana) and configure auto-scaling based on message latency or queue depth.
 6. If a worker throws an exception before sending a valid OCPP response, standard AMQP ACK/NACK principles apply: unconfirmed messages return to the queue for processing by another worker. Handle failure scenarios (e.g., database outages) gracefully to avoid infinite retry loops.
 
+## Examples
+
+Worker examples for [Python](examples/python), [PHP](examples/php) and [.NET](examples/dotnet), plus a [polyglot demo](examples/polyglot-demo) running the same CSMS in Java, Rust and Go with a live dashboard and a Gatling load test of 10,000 OCPP 1.6 / 2.1 chargers across Security Profiles 1, 2 and 3.
+
 ## Offline Detection
 
 Whenever an established charge point connection terminates — clean WebSocket close, TCP drop, crash or broker shutdown — the plugin publishes one final synthetic `StatusNotification` CALL on behalf of the charge point, so backend workers learn about the disconnect through the same channel as any other OCPP traffic. The payload marks the whole charge point (`connectorId` 0) unavailable, shaped for the protocol version the charge point was connected with:

@@ -1,0 +1,24 @@
+[package]
+name = "csms-rust"
+version = "1.0.0"
+edition = "2024"
+description = "OCPP CSMS on rabbitmq-web-ocpp: single async binary (tokio)"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+# Plain AMQP and HTTP inside the compose network: no TLS stacks needed.
+lapin = { version = "4", default-features = false, features = ["tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
