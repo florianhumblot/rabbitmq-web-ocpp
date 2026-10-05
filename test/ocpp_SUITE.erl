@@ -27,6 +27,7 @@
 all() ->
     [{group, tests},
      {group, foreseen},
+     {group, review},
      {group, tls},
      %% Restarts the node, so it runs last.
      {group, node_restart}].
@@ -107,6 +108,15 @@ groups() ->
        global_counters_track_ocpp_traffic,
        %% Back pressure from slow queues
        slow_queue_throttles_charge_point
+      ]},
+     %% Findings of a review of the fixes above.
+     {review, [],
+      [legacy_amq_topic_binding_is_removed,
+       replies_bypass_queued_calls,
+       call_deadline_is_paused_while_reads_are_blocked,
+       idle_timeout_is_suspended_while_reads_are_blocked,
+       malformed_responses_do_not_complete_calls,
+       forced_eviction_does_not_leak_consumers_gauge
       ]},
      %% Coverage of the TLS listener: OCPP security profiles 2 and 3.
      {tls, [],
@@ -794,6 +804,121 @@ slow_queue_throttles_charge_point(Config) ->
     %% Nothing is lost.
     rabbit_ct_helpers:await_condition(
       fun() -> message_count(Config, <<"workers">>) =:= N end, 60000).
+
+%% -------------------------------------------------------------------
+%% Review findings
+%% -------------------------------------------------------------------
+
+%% Queues of charge points that connected before the default exchange changed
+%% are still bound to amq.topic, so MQTT and STOMP clients could still reach
+%% them.
+legacy_amq_topic_binding_is_removed(Config) ->
+    Cid = cid(Config),
+    QName = <<"ocpp.", Cid/binary>>,
+    rabbit_web_ocpp_test_util:with_channel(
+      Config,
+      fun(Ch) ->
+              #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName,
+                                                                              durable = true}),
+              #'queue.bind_ok'{} = amqp_channel:call(Ch, #'queue.bind'{queue = QName,
+                                                                        exchange = <<"amq.topic">>,
+                                                                        routing_key = Cid})
+      end),
+    WS = connect(Config, Cid),
+    publish_to_cp(Config, <<"amq.topic">>, Cid, [2, <<"mqtt-1">>, <<"Reset">>, #{}]),
+    assert_no_frame(WS, 1000),
+    publish_to_cp(Config, Cid, [2, <<"csms-1">>, <<"Reset">>, #{}]),
+    ?assertMatch([2, <<"csms-1">>, _, _], recv(WS)).
+
+%% Unanswered CALLs held back behind the outstanding one used up the
+%% prefetch window: an answer to a request of the charge point queued behind
+%% them could not be delivered until the CALLs timed out.
+replies_bypass_queued_calls(Config) ->
+    set_env(Config, call_timeout, 20000),
+    [begin
+         set_env(Config, queue_type, QueueType),
+         set_env(Config, prefetch_count, Prefetch),
+         Cid = iolist_to_binary(io_lib:format("replies-~s-~b", [QueueType, Prefetch])),
+         WS = connect(Config, Cid),
+         [publish_to_cp(Config, Cid, [2, <<"csms-", (integer_to_binary(I))/binary>>,
+                                      <<"GetConfiguration">>, #{}])
+          || I <- lists:seq(1, Prefetch + 1)],
+         publish_to_cp(Config, Cid, [3, <<"cp-1">>, #{<<"currentTime">> => <<"now">>}]),
+         ?assertMatch([2, <<"csms-1">>, _, _], recv(WS)),
+         ?assertMatch({_, _, [3, <<"cp-1">>, _]}, {QueueType, Prefetch, recv(WS, 5000)}),
+         rfc6455_client:close(WS),
+         wait_for_connections(Config, 0)
+     end || QueueType <- [classic, quorum], Prefetch <- [1, 10]].
+
+%% While the broker does not read from the charge point (resource alarm,
+%% credit flow), its answer cannot arrive: the CALL must not time out.
+call_deadline_is_paused_while_reads_are_blocked(Config) ->
+    set_env(Config, call_timeout, 1000),
+    Cid = cid(Config),
+    declare_worker_queue(Config, <<"workers">>, <<"ocpp16.GetConfiguration.conf">>),
+    WS = connect(Config, Cid),
+    publish_to_cp(Config, Cid, [2, <<"csms-1">>, <<"GetConfiguration">>, #{}]),
+    publish_to_cp(Config, Cid, [2, <<"csms-2">>, <<"GetConfiguration">>, #{}]),
+    ?assertMatch([2, <<"csms-1">>, _, _], recv(WS)),
+    rabbit_ct_broker_helpers:set_alarm(Config, 0, memory),
+    timer:sleep(500),
+    result(WS, <<"csms-1">>, #{}),
+    %% The next CALL is not sent while the answer to the first is unread.
+    assert_no_frame(WS, 2500),
+    rabbit_ct_broker_helpers:clear_alarm(Config, 0, memory),
+    ok = await_count(Config, <<"workers">>, 1),
+    ?assertMatch({<<"ocpp16.GetConfiguration.conf">>, _, [3, <<"csms-1">>, _]},
+                 get_message(Config, <<"workers">>)),
+    ?assertMatch([2, <<"csms-2">>, _, _], recv(WS)).
+
+%% Pongs of a healthy charge point are not read while reads are blocked.
+idle_timeout_is_suspended_while_reads_are_blocked(Config) ->
+    set_env(Config, cowboy_ws_opts, [{idle_timeout, 2000}]),
+    ok = rabbit_web_ocpp_test_util:restart_plugin(Config, 0),
+    declare_worker_queue(Config, <<"workers">>, <<"ocpp16.Heartbeat.req">>),
+    WS = connect(Config, cid(Config)),
+    rabbit_ct_broker_helpers:set_alarm(Config, 0, memory),
+    timer:sleep(500),
+    call(WS, <<"Heartbeat">>, #{}),
+    assert_no_frame(WS, 4000),
+    rabbit_ct_broker_helpers:clear_alarm(Config, 0, memory),
+    ok = await_count(Config, <<"workers">>, 1),
+    ?assertEqual(1, length(connection_pids(Config))).
+
+%% A malformed answer must not complete (acknowledge) the CALL.
+malformed_responses_do_not_complete_calls(Config) ->
+    Cid = cid(Config),
+    %% Declares the charge point queue.
+    WS0 = connect(Config, Cid),
+    rfc6455_client:close(WS0),
+    wait_for_connections(Config, 0),
+    publish_to_cp(Config, Cid, [2, <<"csms-1">>, <<"GetConfiguration">>, #{}]),
+    [begin
+         WS = connect(Config, Cid),
+         ?assertMatch([2, <<"csms-1">>, _, _], recv(WS)),
+         send(WS, Frame),
+         ?assertEqual({Frame, 1002}, {Frame, assert_closed(WS, 5000)}),
+         wait_for_connections(Config, 0)
+     end || Frame <- [[3, <<"csms-1">>, 42],
+                      [4, <<"csms-1">>, <<"GenericError">>, 5, #{}],
+                      [4, <<"csms-1">>, <<"GenericError">>, <<"description">>, [1]]]],
+    %% The CALL is still there.
+    WS2 = connect(Config, Cid),
+    ?assertMatch([2, <<"csms-1">>, _, _], recv(WS2)).
+
+%% A duplicate connection that does not terminate in time is killed, which
+%% skips its terminate callback.
+forced_eviction_does_not_leak_consumers_gauge(Config) ->
+    Cid = cid(Config),
+    Before = maps:get(consumers, counters(Config)),
+    _WS1 = connect(Config, Cid),
+    [Pid1] = connection_pids(Config),
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, sys, suspend, [Pid1]),
+    WS2 = connect(Config, Cid),
+    rfc6455_client:close(WS2),
+    wait_for_connections(Config, 0),
+    rabbit_ct_helpers:await_condition(
+      fun() -> maps:get(consumers, counters(Config)) =:= Before end, 5000).
 
 %% -------------------------------------------------------------------
 %% TLS listener
