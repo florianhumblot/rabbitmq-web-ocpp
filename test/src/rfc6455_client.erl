@@ -157,8 +157,8 @@ do_recv(State = #state{phase = opening, ppid = PPid, data = Data}) ->
         [Http, Data1]   ->
             %% TODO: don't ignore http response data, verify key
             PPid ! {rfc6455, open, self(), [{http_response, Http}]},
-            State#state{phase = open,
-                        data = Data1}
+            do_recv(State#state{phase = open,
+                                data = list_to_binary(Data1)})
     end;
 do_recv(State = #state{phase = Phase, data = Data, socket = Socket, transport = Transport, ppid = PPid})
   when Phase =:= open orelse Phase =:= closing ->
@@ -182,7 +182,7 @@ do_recv(State = #state{phase = Phase, data = Data, socket = Socket, transport = 
     case R of
         moredata ->
             State;
-        _ -> do_recv2(State, R)
+        _ -> do_recv(do_recv2(State, R))
     end.
 
 do_recv2(State = #state{phase = Phase, socket = Socket, ppid = PPid, transport = Transport}, R) ->
@@ -192,6 +192,13 @@ do_recv2(State = #state{phase = Phase, socket = Socket, ppid = PPid, transport =
             State#state{data = Rest};
         {1, 2, Payload, Rest} ->
             PPid ! {rfc6455, recv_binary, self(), Payload},
+            State#state{data = Rest};
+        {1, 9, Payload, Rest} ->
+            %% Answer server pings like any compliant client [RFC 6455 5.5.2].
+            Transport:send(Socket, encode_frame(1, 10, Payload)),
+            PPid ! {rfc6455, ping, self(), Payload},
+            State#state{data = Rest};
+        {1, 10, _Payload, Rest} ->
             State#state{data = Rest};
         {1, 8, Payload, _Rest} ->
             WsReason = case Payload of

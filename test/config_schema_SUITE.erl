@@ -5,9 +5,9 @@
 %% Copyright (c) 2007-2024 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 
--module(web_mqtt_config_schema_SUITE).
+-module(config_schema_SUITE).
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 all() ->
     [
@@ -21,7 +21,7 @@ all() ->
 init_per_suite(Config) ->
     rabbit_ct_helpers:log_environment(),
     Config1 = rabbit_ct_helpers:run_setup_steps(Config),
-    rabbit_ct_config_schema:init_schemas(rabbitmq_web_mqtt, Config1).
+    rabbit_ct_config_schema:init_schemas(rabbitmq_web_ocpp, Config1).
 
 
 end_per_suite(Config) ->

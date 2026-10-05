@@ -16,7 +16,7 @@ endef
 
 LOCAL_DEPS = ssl
 DEPS = rabbit cowboy
-TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management rabbitmq_consistent_hash_exchange rabbitmq_event_exchange
+TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client
 
 PLT_APPS += rabbitmqctl elixir cowlib
 
@@ -29,6 +29,8 @@ DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk
+
+CT_HOOKS = rabbit_ct_hook
 
 # compile: warnings being treated as errors
 # Elixir.RabbitMQ.CLI.Ctl.Commands.ListWebOcppConnectionsCommand.erl:11:2: behaviour 'Elixir.RabbitMQ.CLI.CommandBehaviour' undefined

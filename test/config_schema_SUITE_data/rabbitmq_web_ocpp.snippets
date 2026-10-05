@@ -1,0 +1,73 @@
+[{listener,
+  "web_ocpp.tcp.listener = 127.0.0.1:12345",
+  [{rabbitmq_web_ocpp,
+    [{tcp_config, [{ip,"127.0.0.1"},{port,12345}]}]}],
+  [rabbitmq_web_ocpp]},
+ {tcp_listener_none,
+  "web_ocpp.tcp.listener = none",
+  [{rabbitmq_web_ocpp,
+    [{tcp_config, []}]}],
+  [rabbitmq_web_ocpp]},
+ {tcp_config,
+  "web_ocpp.tcp.ip = 127.0.0.3
+   web_ocpp.tcp.port = 11122",
+  [{rabbitmq_web_ocpp,
+    [{tcp_config, [{ip,"127.0.0.3"},{port,11122}]}]}],
+  [rabbitmq_web_ocpp]},
+ {cowboy_idle_timeout,
+  "web_ocpp.cowboy_opts.idle_timeout = 30000",
+  [{rabbitmq_web_ocpp,
+    [{cowboy_opts, [{idle_timeout, 30000}]}]}],
+  [rabbitmq_web_ocpp]},
+ {cowboy_timeout,
+  "web_ocpp.cowboy_opts.timeout = 30000",
+  [{rabbitmq_web_ocpp,
+    [{cowboy_opts, [{idle_timeout, 30000}]}]}],
+  [rabbitmq_web_ocpp]},
+ {ws_opts,
+  "web_ocpp.ws_opts.compress = true
+   web_ocpp.ws_opts.idle_timeout = 120000
+   web_ocpp.ws_opts.max_frame_size = 65536
+   web_ocpp.ws_opts.ping_interval = 20000",
+  [{rabbitmq_web_ocpp,
+    [{cowboy_ws_opts, [{compress, true},
+                       {idle_timeout, 120000},
+                       {max_frame_size, 65536}]},
+     {ws_ping_interval, 20000}]}],
+  [rabbitmq_web_ocpp]},
+ {exchange_and_prefetch,
+  "web_ocpp.exchange = ocpp.csms
+   web_ocpp.prefetch_count = 5
+   web_ocpp.call_timeout = 10000",
+  [{rabbitmq_web_ocpp,
+    [{exchange, "ocpp.csms"},
+     {prefetch_count, 5},
+     {call_timeout, 10000}]}],
+  [rabbitmq_web_ocpp]},
+ {station_queues,
+  "web_ocpp.queue_type = quorum
+   web_ocpp.queue_message_ttl = 60000
+   web_ocpp.queue_expires = none",
+  [{rabbitmq_web_ocpp,
+    [{queue_type, quorum},
+     {queue_message_ttl, 60000},
+     {queue_expires, none}]}],
+  [rabbitmq_web_ocpp]},
+ {authentication,
+  "web_ocpp.allow_anonymous = false
+   web_ocpp.username_must_match_client_id = false
+   web_ocpp.permission_cache_ttl = 5000
+   web_ocpp.max_client_id_length = 25",
+  [{rabbitmq_web_ocpp,
+    [{allow_anonymous, false},
+     {username_must_match_client_id, false},
+     {permission_cache_ttl, 5000},
+     {max_client_id_length, 25}]}],
+  [rabbitmq_web_ocpp]},
+ {protocols,
+  "web_ocpp.protocols.1 = ocpp1.6
+   web_ocpp.protocols.2 = ocpp2.0.1",
+  [{rabbitmq_web_ocpp,
+    [{protocols, [<<"ocpp1.6">>, <<"ocpp2.0.1">>]}]}],
+  [rabbitmq_web_ocpp]}
+].
