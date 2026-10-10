@@ -1,0 +1,54 @@
+# A 3 node cluster, only for test_cluster.py:
+#   docker compose -f docker-compose.cluster.yml up -d
+#   OCPP_CLUSTER=1 OCPP_URL=ws://localhost:19521/ocpp pytest test_cluster.py
+x-start: &start
+  - bash
+  - -c
+  - >-
+    echo -n ocpp-cluster-test > /var/lib/rabbitmq/.erlang.cookie &&
+    chmod 400 /var/lib/rabbitmq/.erlang.cookie &&
+    chown rabbitmq:rabbitmq /var/lib/rabbitmq/.erlang.cookie &&
+    exec docker-entrypoint.sh rabbitmq-server
+
+services:
+  rabbitmq1:
+    image: ${OCPP_IMAGE:-ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp}
+    hostname: rabbitmq1
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    command: *start
+    volumes:
+      - ./config/cluster.conf:/etc/rabbitmq/conf.d/90-cluster.conf:ro
+      - ./config/advanced.config:/etc/rabbitmq/advanced.config:ro
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+      - "19521:19520"
+
+  rabbitmq2:
+    image: ${OCPP_IMAGE:-ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp}
+    hostname: rabbitmq2
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    command: *start
+    volumes:
+      - ./config/cluster.conf:/etc/rabbitmq/conf.d/90-cluster.conf:ro
+      - ./config/advanced.config:/etc/rabbitmq/advanced.config:ro
+    ports:
+      - "19522:19520"
+
+  rabbitmq3:
+    image: ${OCPP_IMAGE:-ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp}
+    hostname: rabbitmq3
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    command: *start
+    volumes:
+      - ./config/cluster.conf:/etc/rabbitmq/conf.d/90-cluster.conf:ro
+      - ./config/advanced.config:/etc/rabbitmq/advanced.config:ro
+    ports:
+      - "19523:19520"

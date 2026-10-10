@@ -1,0 +1,18 @@
+# The broker under test: by default the published image with the plugin.
+#   OCPP_IMAGE=<image> docker compose up -d   to test another build.
+services:
+  rabbitmq:
+    image: ${OCPP_IMAGE:-ghcr.io/vampirebyte/rabbitmq-web-ocpp:4.3.1-ocpp}
+    # Fixed, so that the node keeps its data across restarts.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    # MQTT is enabled to show that MQTT clients reach charge points (16).
+    command: ["bash", "-c", "rabbitmq-plugins enable --offline rabbitmq_mqtt && exec docker-entrypoint.sh rabbitmq-server"]
+    ports:
+      - "5672:5672"     # AMQP 0-9-1 and 1.0 (CSMS workers)
+      - "15672:15672"   # management API
+      - "15692:15692"   # Prometheus metrics
+      - "19520:19520"   # OCPP-J
+      - "1883:1883"     # MQTT

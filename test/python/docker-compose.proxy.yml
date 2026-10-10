@@ -1,0 +1,8 @@
+# Override: the broker expects a PROXY protocol header on OCPP connections, as
+# behind a load balancer. Only for test_proxy_protocol.py:
+#   docker compose -f docker-compose.yml -f docker-compose.proxy.yml up -d
+#   OCPP_PROXY_PROTOCOL=1 pytest test_proxy_protocol.py
+services:
+  rabbitmq:
+    volumes:
+      - ./config/proxy-protocol.conf:/etc/rabbitmq/conf.d/90-proxy-protocol.conf:ro
