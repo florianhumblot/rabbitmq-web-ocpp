@@ -13,7 +13,7 @@ import ocpp_client as oc
 pytestmark = pytest.mark.skipif(os.environ.get("OCPP_CLUSTER") != "1",
                                 reason="needs the 3 node cluster (docker-compose.cluster.yml)")
 
-COMPOSE = f"docker compose -f {oc.HERE}/docker-compose.cluster.yml"
+COMPOSE = f"docker compose -f {shlex.quote(oc.HERE + '/docker-compose.cluster.yml')}"
 NODE2_URL = os.environ.get("OCPP_NODE2_URL", "ws://localhost:19522/ocpp")
 NODE3_URL = os.environ.get("OCPP_NODE3_URL", "ws://localhost:19523/ocpp")
 

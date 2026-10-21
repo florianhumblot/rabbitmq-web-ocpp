@@ -15,7 +15,9 @@ import requests
 import websocket
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-COMPOSE = f"docker compose -f {HERE}/docker-compose.yml"
+# Quoted: the commands are split with shlex, which drops the backslashes of
+# a Windows path.
+COMPOSE = f"docker compose -f {shlex.quote(HERE + '/docker-compose.yml')}"
 
 
 def env(name, default):
